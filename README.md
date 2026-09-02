@@ -22,14 +22,6 @@ Run the repository's entry point (rather than an older copied notebook or
 python MuZero_Simple.py --env CartPole-v1 --episodes 10
 ```
 
-The example defaults to CPU execution, which avoids TensorFlow CUDA
-initialization errors on machines without a working CUDA device. To opt into a
-GPU explicitly, set its device before launching Python:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python MuZero_Simple.py --env CartPole-v1 --episodes 10
-```
-
 ## Gymnasium migration
 
 The implementation imports `gymnasium`, not the unmaintained `gym` package.
@@ -42,6 +34,5 @@ It follows Gymnasium's current API:
 If a traceback contains `site-packages/gym/` or code such as
 `result = env.step(action)`, it is running an older copy of the program. The
 current entry point calls the Gymnasium API directly. Warnings originating in
-Matplotlib are dependency diagnostics and are unrelated to the environment API
-migration. The `MuZero` constructor also rejects legacy Gym environments early,
-before they can fail inside Gym's NumPy-incompatible environment checker.
+Matplotlib or a CUDA initialization message are dependency/runtime diagnostics
+and are unrelated to the environment API migration.
