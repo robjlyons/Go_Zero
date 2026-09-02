@@ -11,6 +11,12 @@ import argparse
 from dataclasses import dataclass, field
 import gym
 import numpy as np
+
+# This small example runs on the CPU unless the caller explicitly selects CUDA
+# before starting Python (for example, CUDA_VISIBLE_DEVICES=0). Setting this
+# before importing TensorFlow prevents noisy cuInit failures on CPU-only hosts.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import tensorflow as tf
 
 
