@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
-import gymnasium as gym
+import gym
 import numpy as np
 import tensorflow as tf
 
@@ -25,15 +25,27 @@ class Config:
 
 
 def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
-    """Reset a Gymnasium environment and return a flattened observation."""
-    observation, _ = env.reset(seed=seed)
+    """Reset old or new Gym environments and return only the observation."""
+    if seed is None:
+        result = env.reset()
+    else:
+        try:
+            result = env.reset(seed=seed)
+        except TypeError:  # Gym before 0.21 used a separate seed method.
+            env.seed(seed)
+            result = env.reset()
+    observation = result[0] if isinstance(result, tuple) else result
     return np.asarray(observation, dtype=np.float32).reshape(-1)
 
 
 def step_env(env: gym.Env, action: int) -> tuple[np.ndarray, float, bool, dict]:
-    """Step a Gymnasium environment and combine its two completion flags."""
-    observation, reward, terminated, truncated, info = env.step(action)
-    done = terminated or truncated
+    """Step old or new Gym environments using one consistent API."""
+    result = env.step(action)
+    if len(result) == 5:
+        observation, reward, terminated, truncated, info = result
+        done = terminated or truncated
+    else:
+        observation, reward, done, info = result
     return np.asarray(observation, dtype=np.float32).reshape(-1), float(reward), bool(done), info
 
 
@@ -199,7 +211,6 @@ def main() -> None:
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
     env = gym.make(args.env)
-    env.action_space.seed(args.seed)
     config = Config(num_simulations=args.simulations)
     try:
         network = Network(env.action_space.n, config.hidden_units)
