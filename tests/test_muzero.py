@@ -3,16 +3,7 @@ import unittest
 import gymnasium as gym
 import numpy as np
 
-from MuZero_Simple import (
-    ArchiveEntry,
-    CellEncoder,
-    Config,
-    GoExploreArchive,
-    MuZero,
-    Network,
-    reset_env,
-    step_env,
-)
+from MuZero_Simple import Config, MuZero, Network, reset_env, step_env
 
 
 class MuZeroTest(unittest.TestCase):
@@ -50,17 +41,7 @@ class MuZeroTest(unittest.TestCase):
         self.agent.train(1, seed=7)
 
         self.assertGreater(len(self.agent.replay), 0)
-        self.assertGreater(len(self.agent.archive.cells), 1)
         self.assertTrue(np.isfinite(self.agent._train_batch()))
-
-    def test_archive_keeps_best_path_and_does_not_select_terminal_cells(self):
-        archive = GoExploreArchive(CellEncoder(2, 8, 7), 10, np.random.default_rng(7))
-        observation = np.array([1.0, 2.0])
-        archive.add(observation, ArchiveEntry(7, (0, 1), 1.0))
-        archive.add(observation, ArchiveEntry(7, (1,), 2.0, terminal=True))
-        archive.add(np.array([-1.0, -2.0]), ArchiveEntry(7, (), 0.0))
-
-        self.assertEqual(archive.select().actions, ())
 
 
 if __name__ == "__main__":
