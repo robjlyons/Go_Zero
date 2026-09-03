@@ -1,0 +1,7 @@
+# Do not replace this with the unmaintained `gym` package. Gymnasium supports
+# the five-value step API and NumPy 2.
+gymnasium[atari,classic-control]>=1.0,<2
+ale-py>=0.9,<1
+opencv-python-headless>=4.8,<5
+numpy>=1.26,<3
+tensorflow>=2.16,<3
