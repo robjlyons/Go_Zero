@@ -1,26 +1,24 @@
 """A small, self-contained MuZero-style training example.
 
-This is intentionally an educational implementation: it uses episode returns
-and replay rather than MuZero's full unrolled training procedure.
+This is intentionally an educational implementation: it uses one-step online
+targets rather than MuZero's replay buffer and unrolled training procedure.
 Importing this module is safe; training only starts through :func:`main`.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
-import os
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-
-import gymnasium as gym
+import gym
 import numpy as np
+np.bool8 = np.bool
+import os
 
-# Avoid TensorFlow probing CUDA on CPU-only hosts. Set GO_ZERO_USE_GPU=1 to opt
-# in; this must happen before TensorFlow is imported.
-if os.environ.get("GO_ZERO_USE_GPU") != "1":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# This small example runs on the CPU unless the caller explicitly selects CUDA
+# before starting Python (for example, CUDA_VISIBLE_DEVICES=0). Setting this
+# before importing TensorFlow prevents noisy cuInit failures on CPU-only hosts.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
 import tensorflow as tf
 
@@ -33,67 +31,41 @@ class Config:
     hidden_units: int = 128
     max_steps_per_episode: int = 500
     exploration_constant: float = 1.25
+
+    # Replay/training settings.
+    replay_capacity: int = 50_000
     batch_size: int = 32
-    replay_capacity: int = 10_000
     training_steps_per_episode: int = 20
     gradient_clip_norm: float = 5.0
+
+    # Go-Explore archive settings.
     archive_capacity: int = 10_000
     cell_bits: int = 16
 
-    def __post_init__(self) -> None:
-        positive_fields = (
-            "learning_rate",
-            "num_simulations",
-            "hidden_units",
-            "max_steps_per_episode",
-            "batch_size",
-            "replay_capacity",
-            "training_steps_per_episode",
-            "gradient_clip_norm",
-            "archive_capacity",
-            "cell_bits",
-        )
-        for name in positive_fields:
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be greater than zero")
-        if not 0.0 <= self.gamma <= 1.0:
-            raise ValueError("gamma must be between zero and one")
-
 
 def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
-    """Reset a Gymnasium environment and return a flattened observation."""
-    observation, _ = env.reset(seed=seed)
-    return np.asarray(gym.spaces.flatten(env.observation_space, observation), dtype=np.float32)
+    """Reset old or new Gym environments and return only the observation."""
+    if seed is None:
+        result = env.reset()
+    else:
+        try:
+            result = env.reset(seed=seed)
+        except TypeError:  # Gym before 0.21 used a separate seed method.
+            env.seed(seed)
+            result = env.reset()
+    observation = result[0] if isinstance(result, tuple) else result
+    return np.asarray(observation, dtype=np.float32).reshape(-1)
 
 
 def step_env(env: gym.Env, action: int) -> tuple[np.ndarray, float, bool, dict]:
-    """Step a Gymnasium environment and combine its two completion flags."""
-    observation, reward, terminated, truncated, info = env.step(action)
-    done = terminated or truncated
-    flattened = np.asarray(gym.spaces.flatten(env.observation_space, observation), dtype=np.float32)
-    return flattened, float(reward), bool(done), info
-
-
-def make_env(env_id: str, frame_stack: int = 4) -> gym.Env:
-    """Create a standard Gymnasium environment or a preprocessed ALE environment."""
-    if not env_id.startswith("ALE/"):
-        return gym.make(env_id)
-
-    # Gymnasium 1.x no longer loads third-party environment registrations as an
-    # import side effect, so explicitly register ALE only when it is requested.
-    ale_py = importlib.import_module("ale_py")
-    gym.register_envs(ale_py)
-    env = gym.make(env_id, frameskip=1)
-    env = gym.wrappers.AtariPreprocessing(
-        env,
-        frame_skip=4,
-        screen_size=84,
-        grayscale_obs=True,
-        scale_obs=True,
-    )
-    if frame_stack > 1:
-        env = gym.wrappers.FrameStackObservation(env, stack_size=frame_stack)
-    return env
+    """Step old or new Gym environments using one consistent API."""
+    result = env.step(action)
+    if len(result) == 5:
+        observation, reward, terminated, truncated, info = result
+        done = terminated or truncated
+    else:
+        observation, reward, done, info = result
+    return np.asarray(observation, dtype=np.float32).reshape(-1), float(reward), bool(done), info
 
 
 class Network(tf.keras.Model):
@@ -103,22 +75,16 @@ class Network(tf.keras.Model):
         super().__init__()
         self.num_actions = num_actions
         self.representation = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-            ]
+            [tf.keras.layers.Dense(hidden_units, activation="relu"),
+             tf.keras.layers.Dense(hidden_units, activation="relu")]
         )
         self.dynamics = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-                tf.keras.layers.Dense(hidden_units + 1),
-            ]
+            [tf.keras.layers.Dense(hidden_units, activation="relu"),
+             tf.keras.layers.Dense(hidden_units + 1)]
         )
         self.prediction = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-                tf.keras.layers.Dense(num_actions + 1),
-            ]
+            [tf.keras.layers.Dense(hidden_units, activation="relu"),
+             tf.keras.layers.Dense(num_actions + 1)]
         )
 
     def initial_inference(self, observation: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
@@ -153,22 +119,6 @@ class Node:
     @property
     def value(self) -> float:
         return self.value_sum / self.visit_count if self.visit_count else 0.0
-
-
-@dataclass
-class MinMaxStats:
-    """Normalize search values so reward scale does not suppress exploration."""
-
-    minimum: float = float("inf")
-    maximum: float = float("-inf")
-
-    def update(self, value: float) -> None:
-        self.minimum = min(self.minimum, value)
-        self.maximum = max(self.maximum, value)
-
-    def normalize(self, value: float) -> float:
-        value_range = self.maximum - self.minimum
-        return (value - self.minimum) / value_range if value_range > 1e-8 else value
 
 
 @dataclass(frozen=True)
@@ -219,15 +169,9 @@ class GoExploreArchive:
     def add(self, observation: np.ndarray, entry: ArchiveEntry) -> bool:
         key = self.encoder.encode(observation)
         previous = self.cells.get(key)
-        if previous is None:
-            improved = True
-        elif previous.terminal != entry.terminal:
-            # A hash collision must not make an explorable cell unreachable.
-            improved = previous.terminal and not entry.terminal
-        else:
-            improved = entry.score > previous.score or (
-                entry.score == previous.score and len(entry.actions) < len(previous.actions)
-            )
+        improved = previous is None or entry.score > previous.score or (
+            entry.score == previous.score and len(entry.actions) < len(previous.actions)
+        )
         if not improved:
             return False
         if previous is not None:
@@ -235,16 +179,7 @@ class GoExploreArchive:
             del self.cells[key]
         self.cells[key] = entry
         while len(self.cells) > self.capacity:
-            # Discard terminal cells before useful return points. In particular,
-            # an archive of capacity one must retain its non-terminal root.
-            terminal_key = next(
-                (candidate for candidate, value in self.cells.items() if value.terminal),
-                None,
-            )
-            if terminal_key is not None:
-                del self.cells[terminal_key]
-            else:
-                self.cells.popitem(last=False)
+            self.cells.popitem(last=False)
         return True
 
     def select(self) -> ArchiveEntry:
@@ -258,21 +193,24 @@ class GoExploreArchive:
 
 
 class MuZero:
-    def __init__(self, env: gym.Env, network: Network, config: Config, seed: int = 0):
-        if not isinstance(env, gym.Env):
-            raise TypeError(
-                "env must be a Gymnasium environment; legacy Gym environments "
-                "are incompatible with NumPy 2"
-            )
+    def __init__(
+        self,
+        env: gym.Env,
+        network: Network,
+        config: Config,
+        seed: int = 0,
+    ):
         if not isinstance(env.action_space, gym.spaces.Discrete):
             raise ValueError("This example requires a discrete action space")
+
         self.env = env
         self.network = network
         self.config = config
         self.num_actions = env.action_space.n
         self.optimizer = tf.keras.optimizers.Adam(config.learning_rate)
-        self.huber = tf.keras.losses.Huber()
+
         self.replay: deque[Experience] = deque(maxlen=config.replay_capacity)
+
         observation_size = gym.spaces.flatdim(env.observation_space)
         self.rng = np.random.default_rng(seed)
         self.archive = GoExploreArchive(
@@ -284,17 +222,26 @@ class MuZero:
     @staticmethod
     def _expand(node: Node, logits: np.ndarray) -> None:
         priors = tf.nn.softmax(logits).numpy()
-        node.children = {action: Node(float(prior)) for action, prior in enumerate(priors)}
+        node.children = {
+            action: Node(float(prior))
+            for action, prior in enumerate(priors)
+        }
 
-    def _select_child(self, node: Node, min_max_stats: MinMaxStats) -> tuple[int, Node]:
+    def _select_child(self, node: Node) -> tuple[int, Node]:
         scale = np.sqrt(node.visit_count + 1)
 
         def score(child: Node) -> float:
             exploration = (
-                self.config.exploration_constant * child.prior * scale / (child.visit_count + 1)
+                self.config.exploration_constant
+                * child.prior
+                * scale
+                / (child.visit_count + 1)
             )
-            exploitation = min_max_stats.normalize(child.reward + self.config.gamma * child.value)
-            return exploitation + exploration
+            return (
+                child.reward
+                + self.config.gamma * child.value
+                + exploration
+            )
 
         return max(node.children.items(), key=lambda item: score(item[1]))
 
@@ -302,155 +249,350 @@ class MuZero:
         hidden, value, logits = self.network.initial_inference(
             tf.convert_to_tensor(observation[None, :], dtype=tf.float32)
         )
+
         root = Node(1.0, hidden.numpy()[0])
         self._expand(root, logits.numpy()[0])
-        min_max_stats = MinMaxStats()
 
         for _ in range(self.config.num_simulations):
             node = root
             path = [root]
+            value_to_back_up = float(value.numpy()[0])
+
             while node.children:
-                action, node = self._select_child(node, min_max_stats)
+                action, node = self._select_child(node)
                 path.append(node)
+
                 if node.hidden_state is None:
                     parent_hidden = path[-2].hidden_state
-                    next_hidden, reward, leaf_value, leaf_logits = self.network.recurrent_inference(
-                        tf.convert_to_tensor(parent_hidden[None, :], dtype=tf.float32),
-                        tf.convert_to_tensor([action]),
+                    next_hidden, reward, leaf_value, leaf_logits = (
+                        self.network.recurrent_inference(
+                            tf.convert_to_tensor(
+                                parent_hidden[None, :],
+                                dtype=tf.float32,
+                            ),
+                            tf.convert_to_tensor([action]),
+                        )
                     )
                     node.hidden_state = next_hidden.numpy()[0]
                     node.reward = float(reward.numpy()[0])
                     self._expand(node, leaf_logits.numpy()[0])
                     value_to_back_up = float(leaf_value.numpy()[0])
                     break
-            else:
-                value_to_back_up = float(value.numpy()[0])
 
             for visited in reversed(path):
                 visited.visit_count += 1
                 visited.value_sum += value_to_back_up
-                min_max_stats.update(visited.reward + self.config.gamma * visited.value)
-                value_to_back_up = visited.reward + self.config.gamma * value_to_back_up
+                value_to_back_up = (
+                    visited.reward
+                    + self.config.gamma * value_to_back_up
+                )
+
         return root
 
-    def train(self, num_episodes: int, seed: int | None = None) -> None:
-        initial_seed = 0 if seed is None else seed
-        initial_observation = reset_env(self.env, initial_seed)
-        self.archive.add(initial_observation, ArchiveEntry(initial_seed, (), 0.0))
+    def train(
+        self,
+        num_episodes: int,
+        seed: int | None = None,
+    ) -> None:
         for episode in range(num_episodes):
-            start = self.archive.select()
-            observation, total_reward, restored_actions, done = self._return_to_cell(start)
-            trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
-            actions = list(restored_actions)
-            steps_remaining = self.config.max_steps_per_episode - len(actions)
-            for _ in range(max(0, steps_remaining)):
-                if done:
-                    break
-                root = self.mcts(observation)
-                visits = np.array([root.children[a].visit_count for a in range(self.num_actions)])
-                policy_target = visits / max(visits.sum(), 1)
-                action = int(self.rng.choice(self.num_actions, p=policy_target))
-                next_observation, reward, done, _ = step_env(self.env, action)
-                actions.append(action)
-                trajectory.append(
-                    (
-                        observation.copy(),
-                        action,
-                        reward,
-                        next_observation.copy(),
-                        policy_target,
-                    )
-                )
-                observation = next_observation
-                total_reward += reward
-                self.archive.add(
-                    next_observation,
-                    ArchiveEntry(start.seed, tuple(actions), total_reward, terminal=done),
-                )
-                if done:
-                    break
+            episode_seed = (
+                None if seed is None else seed + episode
+            )
 
+            # Always create a reproducible starting cell for this episode.
+            initial_observation = reset_env(self.env, episode_seed)
+            archive_seed = episode if episode_seed is None else episode_seed
+            self.archive.add(
+                initial_observation,
+                ArchiveEntry(
+                    seed=archive_seed,
+                    actions=(),
+                    score=0.0,
+                    terminal=False,
+                ),
+            )
+
+            # Go back to a previously discovered, non-terminal cell.
+            start = self.archive.select()
+            (
+                observation,
+                total_reward,
+                completed_actions,
+                done,
+            ) = self._return_to_cell(start)
+
+            actions = list(completed_actions)
+            trajectory: list[
+                tuple[np.ndarray, int, float, np.ndarray, np.ndarray]
+            ] = []
+
+            if not done:
+                for _ in range(self.config.max_steps_per_episode):
+                    root = self.mcts(observation)
+
+                    visits = np.asarray(
+                        [
+                            root.children[action].visit_count
+                            for action in range(self.num_actions)
+                        ],
+                        dtype=np.float64,
+                    )
+
+                    if visits.sum() <= 0:
+                        policy_target = np.full(
+                            self.num_actions,
+                            1.0 / self.num_actions,
+                            dtype=np.float32,
+                        )
+                    else:
+                        policy_target = (
+                            visits / visits.sum()
+                        ).astype(np.float32)
+
+                    action = int(
+                        self.rng.choice(
+                            self.num_actions,
+                            p=policy_target,
+                        )
+                    )
+
+                    (
+                        next_observation,
+                        reward,
+                        done,
+                        _,
+                    ) = step_env(self.env, action)
+
+                    actions.append(action)
+                    trajectory.append(
+                        (
+                            observation.copy(),
+                            action,
+                            reward,
+                            next_observation.copy(),
+                            policy_target.copy(),
+                        )
+                    )
+
+                    observation = next_observation
+                    total_reward += reward
+
+                    self.archive.add(
+                        next_observation,
+                        ArchiveEntry(
+                            seed=start.seed,
+                            actions=tuple(actions),
+                            score=total_reward,
+                            terminal=done,
+                        ),
+                    )
+
+                    if done:
+                        break
+
+            # Monte-Carlo return targets for each transition.
             discounted_return = 0.0
-            for observation, action, reward, next_observation, policy in reversed(trajectory):
-                discounted_return = reward + self.config.gamma * discounted_return
+            for (
+                observation_t,
+                action_t,
+                reward_t,
+                next_observation_t,
+                policy_t,
+            ) in reversed(trajectory):
+                discounted_return = (
+                    reward_t
+                    + self.config.gamma * discounted_return
+                )
                 self.replay.append(
                     Experience(
-                        observation,
-                        action,
-                        reward,
-                        next_observation,
-                        policy,
-                        discounted_return,
+                        observation=observation_t,
+                        action=action_t,
+                        reward=reward_t,
+                        next_observation=next_observation_t,
+                        policy=policy_t,
+                        value=discounted_return,
                     )
                 )
 
-            losses = [self._train_batch() for _ in range(self.config.training_steps_per_episode)]
+            losses = []
+            if self.replay:
+                losses = [
+                    self._train_batch()
+                    for _ in range(
+                        self.config.training_steps_per_episode
+                    )
+                ]
+
+            mean_loss = (
+                float(np.mean(losses))
+                if losses
+                else float("nan")
+            )
+
             print(
-                f"Episode {episode + 1}: reward={total_reward:.2f}, "
-                f"loss={np.mean(losses):.4f}, replay={len(self.replay)}, "
+                f"Episode {episode + 1}: "
+                f"reward={total_reward:.2f}, "
+                f"loss={mean_loss:.4f}, "
+                f"replay={len(self.replay)}, "
                 f"archive={len(self.archive.cells)}"
             )
 
     def _return_to_cell(
-        self, entry: ArchiveEntry
+        self,
+        entry: ArchiveEntry,
     ) -> tuple[np.ndarray, float, tuple[int, ...], bool]:
         """Restore a cell by deterministically replaying its action trajectory."""
         observation = reset_env(self.env, entry.seed)
         score = 0.0
         completed_actions: list[int] = []
         done = False
+
         for action in entry.actions:
-            observation, reward, done, _ = step_env(self.env, action)
+            observation, reward, done, _ = step_env(
+                self.env,
+                action,
+            )
             score += reward
             completed_actions.append(action)
+
             if done:
                 break
-        return observation, score, tuple(completed_actions), done
+
+        return (
+            observation,
+            score,
+            tuple(completed_actions),
+            done,
+        )
 
     def _train_batch(self) -> float:
-        batch_size = min(self.config.batch_size, len(self.replay))
-        if batch_size == 0:
-            raise RuntimeError("cannot train before collecting an experience")
-        indices = self.rng.choice(len(self.replay), batch_size, replace=False)
-        batch = [self.replay[index] for index in indices]
-        observations = np.stack([sample.observation for sample in batch])
-        actions = np.asarray([sample.action for sample in batch], dtype=np.int32)
-        rewards = np.asarray([sample.reward for sample in batch], dtype=np.float32)
-        next_observations = np.stack([sample.next_observation for sample in batch])
-        policies = np.stack([sample.policy for sample in batch])
-        values = np.asarray([sample.value for sample in batch], dtype=np.float32)
+        if not self.replay:
+            return 0.0
+
+        batch_size = min(
+            self.config.batch_size,
+            len(self.replay),
+        )
+        indices = self.rng.choice(
+            len(self.replay),
+            size=batch_size,
+            replace=False,
+        )
+        batch = [self.replay[int(index)] for index in indices]
+
+        observations = np.stack(
+            [sample.observation for sample in batch]
+        ).astype(np.float32)
+        actions = np.asarray(
+            [sample.action for sample in batch],
+            dtype=np.int32,
+        )
+        rewards = np.asarray(
+            [sample.reward for sample in batch],
+            dtype=np.float32,
+        )
+        next_observations = np.stack(
+            [sample.next_observation for sample in batch]
+        ).astype(np.float32)
+        policies = np.stack(
+            [sample.policy for sample in batch]
+        ).astype(np.float32)
+        values = np.asarray(
+            [sample.value for sample in batch],
+            dtype=np.float32,
+        )
 
         with tf.GradientTape() as tape:
-            hidden, predicted_values, logits = self.network.initial_inference(observations)
-            next_hidden, predicted_rewards, _, _ = self.network.recurrent_inference(hidden, actions)
-            value_loss = self.huber(values, predicted_values)
-            reward_loss = self.huber(rewards, predicted_rewards)
+            (
+                hidden,
+                predicted_values,
+                logits,
+            ) = self.network.initial_inference(
+                tf.convert_to_tensor(
+                    observations,
+                    dtype=tf.float32,
+                )
+            )
+
+            (
+                next_hidden,
+                predicted_rewards,
+                _,
+                _,
+            ) = self.network.recurrent_inference(
+                hidden,
+                tf.convert_to_tensor(actions),
+            )
+
+            value_loss = tf.reduce_mean(
+                tf.keras.losses.huber(
+                    values,
+                    predicted_values,
+                )
+            )
+            reward_loss = tf.reduce_mean(
+                tf.keras.losses.huber(
+                    rewards,
+                    predicted_rewards,
+                )
+            )
             policy_loss = tf.reduce_mean(
-                tf.nn.softmax_cross_entropy_with_logits(labels=policies, logits=logits)
+                tf.nn.softmax_cross_entropy_with_logits(
+                    labels=policies,
+                    logits=logits,
+                )
             )
-            # Encourage the learned dynamics state to match the next represented state.
-            target_hidden = self.network.representation(next_observations)
+
+            target_hidden = self.network.representation(
+                tf.convert_to_tensor(
+                    next_observations,
+                    dtype=tf.float32,
+                )
+            )
             consistency_loss = tf.reduce_mean(
-                tf.square(next_hidden - tf.stop_gradient(target_hidden))
+                tf.square(
+                    next_hidden
+                    - tf.stop_gradient(target_hidden)
+                )
             )
-            loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
-        gradients = tape.gradient(loss, self.network.trainable_variables)
-        gradient_pairs = [
+
+            loss = (
+                value_loss
+                + reward_loss
+                + policy_loss
+                + 0.1 * consistency_loss
+            )
+
+        gradients = tape.gradient(
+            loss,
+            self.network.trainable_variables,
+        )
+        gradient_variable_pairs = [
             (gradient, variable)
-            for gradient, variable in zip(gradients, self.network.trainable_variables)
+            for gradient, variable in zip(
+                gradients,
+                self.network.trainable_variables,
+            )
             if gradient is not None
         ]
-        clipped, _ = tf.clip_by_global_norm(
-            [gradient for gradient, _ in gradient_pairs], self.config.gradient_clip_norm
-        )
-        self.optimizer.apply_gradients(zip(clipped, [variable for _, variable in gradient_pairs]))
-        return float(loss.numpy())
 
+        if gradient_variable_pairs:
+            grads, variables = zip(
+                *gradient_variable_pairs
+            )
+            clipped_grads, _ = tf.clip_by_global_norm(
+                grads,
+                self.config.gradient_clip_norm,
+            )
+            self.optimizer.apply_gradients(
+                zip(clipped_grads, variables)
+            )
+
+        return float(loss.numpy())
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", default="ALE/Pong-v5")
-    parser.add_argument("--frame-stack", type=int, default=4)
+    parser.add_argument("--env", default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--simulations", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -463,9 +605,7 @@ def main() -> None:
 
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
-    if args.frame_stack < 1:
-        parser.error("--frame-stack must be at least 1")
-    env = make_env(args.env, args.frame_stack)
+    env = gym.make(args.env)
     env.action_space.seed(args.seed)
     config = Config(
         num_simulations=args.simulations,
