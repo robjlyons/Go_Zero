@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass, field
 import gym
 import numpy as np
+np.bool8 = np.bool
 import os
 
 # This small example runs on the CPU unless the caller explicitly selects CUDA
