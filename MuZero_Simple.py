@@ -93,7 +93,9 @@ class Network(tf.keras.Model):
 
     def __init__(self, num_actions: int, hidden_units: int):
         super().__init__()
-        self.num_actions = num_actions
+        # Gymnasium/ALE may expose Discrete.n as np.int64.
+        # Keras 3 requires Dense(units=...) to be a native Python int.
+        self.num_actions = int(num_actions)
         self.representation = tf.keras.Sequential(
             [tf.keras.layers.Dense(hidden_units, activation="relu"),
              tf.keras.layers.Dense(hidden_units, activation="relu")]
@@ -104,7 +106,7 @@ class Network(tf.keras.Model):
         )
         self.prediction = tf.keras.Sequential(
             [tf.keras.layers.Dense(hidden_units, activation="relu"),
-             tf.keras.layers.Dense(num_actions + 1)]
+             tf.keras.layers.Dense(self.num_actions + 1)]
         )
 
     def initial_inference(self, observation: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
@@ -226,7 +228,7 @@ class MuZero:
         self.env = env
         self.network = network
         self.config = config
-        self.num_actions = env.action_space.n
+        self.num_actions = int(env.action_space.n)
         self.optimizer = tf.keras.optimizers.Adam(config.learning_rate)
 
         self.replay: deque[Experience] = deque(maxlen=config.replay_capacity)
@@ -636,7 +638,7 @@ def main() -> None:
         cell_bits=args.cell_bits,
     )
     try:
-        network = Network(env.action_space.n, config.hidden_units)
+        network = Network(int(env.action_space.n), config.hidden_units)
         MuZero(env, network, config, args.seed).train(args.episodes, args.seed)
     finally:
         env.close()
