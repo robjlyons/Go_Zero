@@ -26,6 +26,14 @@ Training uses a hard environment-transition budget rather than an episode
 count. Actions replayed while returning to a Go-Explore archive cell are
 included in `--max-steps`, so the limit also bounds emulator work.
 
+Every run also writes `training_metrics.jsonl` by default. Each JSON Lines
+record contains cumulative environment steps, newly collected and replayed
+steps, reward, loss, replay/archive sizes, rollout and total wall time, and
+environment steps per second. The file is truncated when a run starts and
+updated after every rollout, making it suitable for streaming into dashboards
+or comparing Atari configurations. Select another destination with
+`--log-file runs/pong.jsonl`.
+
 ## Atari performance
 
 Atari environments automatically use the input pipeline popularized by

@@ -8,9 +8,12 @@ Importing this module is safe; training only starts through :func:`main`.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import ale_py
 import gymnasium as gym
@@ -377,6 +380,7 @@ class MuZero:
         self,
         max_steps: int,
         seed: int | None = None,
+        log_path: str | os.PathLike[str] | None = "training_metrics.jsonl",
     ) -> None:
         """Train until ``max_steps`` environment transitions have been executed.
 
@@ -387,9 +391,16 @@ class MuZero:
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
 
+        metrics_path = Path(log_path) if log_path is not None else None
+        if metrics_path is not None:
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text("", encoding="utf-8")
+
+        training_started = time.perf_counter()
         total_steps = 0
         rollout = 0
         while total_steps < max_steps:
+            rollout_started = time.perf_counter()
             rollout_seed = None if seed is None else seed + rollout
 
             # Always create a reproducible starting cell for this rollout.
@@ -413,7 +424,8 @@ class MuZero:
                 completed_actions,
                 done,
             ) = self._return_to_cell(start, max_steps - total_steps)
-            total_steps += len(completed_actions)
+            replayed_steps = len(completed_actions)
+            total_steps += replayed_steps
 
             actions = list(completed_actions)
             trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
@@ -506,12 +518,36 @@ class MuZero:
                 ]
 
             mean_loss = float(np.mean(losses)) if losses else float("nan")
+            elapsed_seconds = time.perf_counter() - training_started
+            rollout_seconds = time.perf_counter() - rollout_started
+            collected_steps = len(trajectory)
+            steps_per_second = total_steps / max(elapsed_seconds, np.finfo(float).eps)
+
+            metrics = {
+                "rollout": rollout + 1,
+                "environment_steps": total_steps,
+                "max_steps": max_steps,
+                "collected_steps": collected_steps,
+                "replayed_steps": replayed_steps,
+                "reward": total_reward,
+                "loss": mean_loss if np.isfinite(mean_loss) else None,
+                "replay_size": len(self.replay),
+                "archive_size": len(self.archive.cells),
+                "terminal": done,
+                "rollout_seconds": rollout_seconds,
+                "elapsed_seconds": elapsed_seconds,
+                "steps_per_second": steps_per_second,
+            }
+            if metrics_path is not None:
+                with metrics_path.open("a", encoding="utf-8") as metrics_file:
+                    metrics_file.write(json.dumps(metrics, allow_nan=False) + "\n")
 
             print(
                 f"Rollout {rollout + 1}: "
                 f"steps={total_steps}/{max_steps}, "
                 f"reward={total_reward:.2f}, "
                 f"loss={mean_loss:.4f}, "
+                f"steps/s={steps_per_second:.2f}, "
                 f"replay={len(self.replay)}, "
                 f"archive={len(self.archive.cells)}"
             )
@@ -662,6 +698,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", default="CartPole-v1")
     parser.add_argument("--max-steps", type=int, default=10_000)
+    parser.add_argument(
+        "--log-file",
+        default="training_metrics.jsonl",
+        help="JSON Lines destination for rollout and throughput metrics",
+    )
     parser.add_argument("--simulations", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--training-steps", type=int, default=20)
@@ -691,7 +732,11 @@ def main() -> None:
     env.action_space.seed(args.seed)
     try:
         network = Network(int(env.action_space.n), config.hidden_units)
-        MuZero(env, network, config, args.seed).train(args.max_steps, args.seed)
+        MuZero(env, network, config, args.seed).train(
+            args.max_steps,
+            args.seed,
+            args.log_file,
+        )
     finally:
         env.close()
 
