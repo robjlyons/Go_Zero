@@ -11,6 +11,7 @@ import argparse
 from dataclasses import dataclass, field
 import gym
 import numpy as np
+import os
 
 # This small example runs on the CPU unless the caller explicitly selects CUDA
 # before starting Python (for example, CUDA_VISIBLE_DEVICES=0). Setting this
