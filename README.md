@@ -19,8 +19,43 @@ Run the repository's entry point (rather than an older copied notebook or
 `Go_Zero.py` file):
 
 ```bash
-python MuZero_Simple.py --env CartPole-v1 --episodes 10
+python MuZero_Simple.py --env CartPole-v1 --max-steps 10000
 ```
+
+Training uses a hard environment-transition budget rather than an episode
+count. Actions replayed while returning to a Go-Explore archive cell are
+included in `--max-steps`, so the limit also bounds emulator work.
+
+Every run also writes `training_metrics.jsonl` by default. Each JSON Lines
+record contains cumulative environment steps, newly collected and replayed
+steps, reward, loss, replay/archive sizes, rollout and total wall time, and
+environment steps per second. The file is truncated when a run starts and
+updated after every rollout, making it suitable for streaming into dashboards
+or comparing Atari configurations. Select another destination with
+`--log-file runs/pong.jsonl`.
+
+## Atari performance
+
+Atari environments automatically use the input pipeline popularized by
+Stable-Baselines3: deterministic ALE actions, 4-frame action repeat with
+max-pooling, 84x84 grayscale frames, and a stack of four observations. Byte
+pixels are normalized to `[0, 1]` before inference. This reduces each network
+input from 100,800 raw RGB values to 28,224 values and avoids processing every
+emulator frame independently.
+
+```bash
+python MuZero_Simple.py --env ALE/Pong-v5 --max-steps 1000000
+```
+
+The defaults can be tuned with `--atari-screen-size`, `--atari-frame-skip`, and
+`--atari-frame-stack`. The standard `84`, `4`, and `4` values are recommended
+when comparing throughput with Stable-Baselines3. MuZero's MCTS still performs
+many more model calls per action than model-free algorithms such as PPO or DQN;
+lower `--simulations` when environment steps per second matter more than search
+quality.
+
+The replay store is a fixed-size, constant-time ring buffer, so random batch
+sampling does not become progressively slower as a long Atari run fills it.
 
 ## Gymnasium migration
 
