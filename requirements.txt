@@ -1,3 +1,4 @@
-gymnasium[classic-control]>=1.0,<2
+gymnasium[atari,classic-control]>=1.0,<2
 numpy>=1.26,<3
+opencv-python-headless>=4.8,<5
 tensorflow>=2.16,<3

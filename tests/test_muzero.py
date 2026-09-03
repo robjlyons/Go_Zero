@@ -3,7 +3,16 @@ import unittest
 import gymnasium as gym
 import numpy as np
 
-from MuZero_Simple import Config, MuZero, Network, reset_env, step_env
+from MuZero_Simple import (
+    Config,
+    Experience,
+    MuZero,
+    Network,
+    ReplayBuffer,
+    _prepare_observation,
+    reset_env,
+    step_env,
+)
 
 
 class MuZeroTest(unittest.TestCase):
@@ -42,6 +51,29 @@ class MuZeroTest(unittest.TestCase):
 
         self.assertGreater(len(self.agent.replay), 0)
         self.assertTrue(np.isfinite(self.agent._train_batch()))
+
+
+class PerformanceHelpersTest(unittest.TestCase):
+    @staticmethod
+    def _experience(action):
+        observation = np.zeros(1, dtype=np.float32)
+        return Experience(observation, action, 0.0, observation, observation, 0.0)
+
+    def test_replay_buffer_overwrites_oldest_slot(self):
+        replay = ReplayBuffer(2)
+        replay.append(self._experience(0))
+        replay.append(self._experience(1))
+        replay.append(self._experience(2))
+
+        self.assertEqual(len(replay), 2)
+        self.assertEqual({replay[0].action, replay[1].action}, {1, 2})
+
+    def test_byte_observations_are_scaled_and_flattened(self):
+        observation = np.array([[0, 255]], dtype=np.uint8)
+
+        prepared = _prepare_observation(observation)
+
+        np.testing.assert_array_equal(prepared, np.array([0.0, 1.0], dtype=np.float32))
 
 
 if __name__ == "__main__":
