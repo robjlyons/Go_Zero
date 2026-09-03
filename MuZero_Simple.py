@@ -10,8 +10,12 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-import gym
+import gymnasium as gym
 import ale_py
+
+# Register the Arcade Learning Environment with Gymnasium.
+# This is required/recommended with modern Gymnasium + ALE releases.
+gym.register_envs(ale_py)
 import numpy as np
 np.bool8 = np.bool
 import os
@@ -42,6 +46,21 @@ class Config:
     # Go-Explore archive settings.
     archive_capacity: int = 10_000
     cell_bits: int = 16
+
+
+def make_env(env_id: str) -> gym.Env:
+    """Create either a normal Gymnasium env or an ALE Atari env.
+
+    Go-Explore restores archived cells by replaying their action trajectories.
+    ALE/v5 normally uses sticky actions, so Atari is created with
+    repeat_action_probability=0.0 to make replay deterministic.
+    """
+    if env_id.startswith("ALE/"):
+        return gym.make(
+            env_id,
+            repeat_action_probability=0.0,
+        )
+    return gym.make(env_id)
 
 
 def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
@@ -606,7 +625,7 @@ def main() -> None:
 
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
-    env = gym.make(args.env)
+    env = make_env(args.env)
     env.action_space.seed(args.seed)
     config = Config(
         num_simulations=args.simulations,
