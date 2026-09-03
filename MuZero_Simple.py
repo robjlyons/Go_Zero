@@ -11,6 +11,7 @@ import argparse
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 import gym
+import ale_py
 import numpy as np
 np.bool8 = np.bool
 import os
