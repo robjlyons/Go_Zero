@@ -387,9 +387,6 @@ def main() -> None:
         network = Network(env.action_space.n, config.hidden_units)
         MuZero(env, network, config, args.seed).train(args.episodes, args.seed)
         config = Config(num_simulations=args.simulations)
-    try:
-        network = Network(env.action_space.n, config.hidden_units)
-        MuZero(env, network, config).train(args.episodes, args.seed)
     finally:
         env.close()
 
