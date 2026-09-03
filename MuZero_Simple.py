@@ -304,60 +304,129 @@ class MuZero:
         return observation, score, tuple(completed_actions), done
 
     def _train_batch(self) -> float:
-        batch_size = min(self.config.batch_size, len(self.replay))
-        indices = np.random.choice(len(self.replay), batch_size, replace=False)
-        batch = [self.replay[index] for index in indices]
-        observations = np.stack([sample.observation for sample in batch])
-        actions = np.asarray([sample.action for sample in batch], dtype=np.int32)
-        rewards = np.asarray([sample.reward for sample in batch], dtype=np.float32)
-        next_observations = np.stack([sample.next_observation for sample in batch])
-        policies = np.stack([sample.policy for sample in batch])
-        values = np.asarray([sample.value for sample in batch], dtype=np.float32)
+        if not self.replay:
+            return 0.0
 
-        with tf.GradientTape() as tape:
-            hidden, predicted_values, logits = self.network.initial_inference(observations)
-            next_hidden, predicted_rewards, _, _ = self.network.recurrent_inference(hidden, actions)
-            value_loss = tf.reduce_mean(tf.keras.losses.huber(values, predicted_values))
-            reward_loss = tf.reduce_mean(tf.keras.losses.huber(rewards, predicted_rewards))
-            policy_loss = tf.reduce_mean(
-                tf.nn.softmax_cross_entropy_with_logits(labels=policies, logits=logits)
-            )
-            # Encourage the learned dynamics state to match the next represented state.
-            target_hidden = self.network.representation(next_observations)
-            consistency_loss = tf.reduce_mean(tf.square(next_hidden - tf.stop_gradient(target_hidden)))
-            loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
-            gradients = tape.gradient(loss, self.network.trainable_variables)
-            gradients, _ = tf.clip_by_global_norm(gradients, self.config.gradient_clip_norm)
-            losses.append(self._train_step(observation, action, reward, next_observation, done, policy_target))
-            observation = next_observation
-            total_reward += reward
-        if done:
-            break
-        print(f"Episode {episode + 1}: reward={total_reward:.2f}, loss={np.mean(losses):.4f}")
-
-    def _train_step(self, observation, action, reward, next_observation, done, policy_target) -> float:
-        with tf.GradientTape() as tape:
-            hidden, value, logits = self.network.initial_inference(observation[None, :])
-            next_hidden, predicted_reward, _, _ = self.network.recurrent_inference(hidden, [action])
-            _, next_value, _ = self.network.initial_inference(next_observation[None, :])
-            target_value = reward + self.config.gamma * next_value[0] * (1.0 - float(done))
-            value_loss = tf.square(tf.stop_gradient(target_value) - value[0])
-            reward_loss = tf.square(reward - predicted_reward[0])
-            policy_loss = tf.nn.softmax_cross_entropy_with_logits(
-                labels=policy_target[None, :], logits=logits
-            )[0]
-            # Encourage the learned dynamics state to match the next represented state.
-            target_hidden = self.network.representation(next_observation[None, :])
-            consistency_loss = tf.reduce_mean(tf.square(next_hidden - tf.stop_gradient(target_hidden)))
-            loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
-        gradients = tape.gradient(loss, self.network.trainable_variables)
-        self.optimizer.apply_gradients(
-            (gradient, variable) for gradient, variable in zip(gradients, self.network.trainable_variables)
-            if gradient is not None
+        batch_size = min(
+            self.config.batch_size,
+            len(self.replay),
         )
+        indices = self.rng.choice(
+            len(self.replay),
+            size=batch_size,
+            replace=False,
+        )
+        batch = [self.replay[int(index)] for index in indices]
+
+        observations = np.stack(
+            [sample.observation for sample in batch]
+        ).astype(np.float32)
+        actions = np.asarray(
+            [sample.action for sample in batch],
+            dtype=np.int32,
+        )
+        rewards = np.asarray(
+            [sample.reward for sample in batch],
+            dtype=np.float32,
+        )
+        next_observations = np.stack(
+            [sample.next_observation for sample in batch]
+        ).astype(np.float32)
+        policies = np.stack(
+            [sample.policy for sample in batch]
+        ).astype(np.float32)
+        values = np.asarray(
+            [sample.value for sample in batch],
+            dtype=np.float32,
+        )
+
+        with tf.GradientTape() as tape:
+            (
+                hidden,
+                predicted_values,
+                logits,
+            ) = self.network.initial_inference(
+                tf.convert_to_tensor(
+                    observations,
+                    dtype=tf.float32,
+                )
+            )
+
+            (
+                next_hidden,
+                predicted_rewards,
+                _,
+                _,
+            ) = self.network.recurrent_inference(
+                hidden,
+                tf.convert_to_tensor(actions),
+            )
+
+            value_loss = tf.reduce_mean(
+                tf.keras.losses.huber(
+                    values,
+                    predicted_values,
+                )
+            )
+            reward_loss = tf.reduce_mean(
+                tf.keras.losses.huber(
+                    rewards,
+                    predicted_rewards,
+                )
+            )
+            policy_loss = tf.reduce_mean(
+                tf.nn.softmax_cross_entropy_with_logits(
+                    labels=policies,
+                    logits=logits,
+                )
+            )
+
+            target_hidden = self.network.representation(
+                tf.convert_to_tensor(
+                    next_observations,
+                    dtype=tf.float32,
+                )
+            )
+            consistency_loss = tf.reduce_mean(
+                tf.square(
+                    next_hidden
+                    - tf.stop_gradient(target_hidden)
+                )
+            )
+
+            loss = (
+                value_loss
+                + reward_loss
+                + policy_loss
+                + 0.1 * consistency_loss
+            )
+
+        gradients = tape.gradient(
+            loss,
+            self.network.trainable_variables,
+        )
+        gradient_variable_pairs = [
+            (gradient, variable)
+            for gradient, variable in zip(
+                gradients,
+                self.network.trainable_variables,
+            )
+            if gradient is not None
+        ]
+
+        if gradient_variable_pairs:
+            grads, variables = zip(
+                *gradient_variable_pairs
+            )
+            clipped_grads, _ = tf.clip_by_global_norm(
+                grads,
+                self.config.gradient_clip_norm,
+            )
+            self.optimizer.apply_gradients(
+                zip(clipped_grads, variables)
+            )
+
         return float(loss.numpy())
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", default="CartPole-v1")
