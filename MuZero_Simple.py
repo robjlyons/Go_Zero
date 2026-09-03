@@ -8,24 +8,22 @@ Importing this module is safe; training only starts through :func:`main`.
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict, deque
-from dataclasses import dataclass, field
-import gymnasium as gym
-import ale_py
-
-# Register the Arcade Learning Environment with Gymnasium.
-# This is required/recommended with modern Gymnasium + ALE releases.
-gym.register_envs(ale_py)
-import numpy as np
-np.bool8 = np.bool
 import os
+from collections import OrderedDict
+from dataclasses import dataclass, field
+
+import ale_py
+import gymnasium as gym
+import numpy as np
+
+np.bool8 = np.bool
 
 # This small example runs on the CPU unless the caller explicitly selects CUDA
 # before starting Python (for example, CUDA_VISIBLE_DEVICES=0). Setting this
 # before importing TensorFlow prevents noisy cuInit failures on CPU-only hosts.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
-import tensorflow as tf
+import tensorflow as tf  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -47,8 +45,15 @@ class Config:
     archive_capacity: int = 10_000
     cell_bits: int = 16
 
+    # Match the commonly used Stable-Baselines3 Atari input pipeline. Reducing
+    # a raw 210x160x3 frame to four 84x84 grayscale frames is both substantially
+    # faster and much easier for the small fully-connected network to process.
+    atari_screen_size: int = 84
+    atari_frame_skip: int = 4
+    atari_frame_stack: int = 4
 
-def make_env(env_id: str) -> gym.Env:
+
+def make_env(env_id: str, config: Config | None = None) -> gym.Env:
     """Create either a normal Gymnasium env or an ALE Atari env.
 
     Go-Explore restores archived cells by replaying their action trajectories.
@@ -56,11 +61,39 @@ def make_env(env_id: str) -> gym.Env:
     repeat_action_probability=0.0 to make replay deterministic.
     """
     if env_id.startswith("ALE/"):
-        return gym.make(
+        # Registration is deliberately kept beside Atari construction so that
+        # importing the educational module does not initialize ALE needlessly.
+        gym.register_envs(ale_py)
+        config = config or Config()
+        env = gym.make(
             env_id,
             repeat_action_probability=0.0,
+            # AtariPreprocessing performs frame skipping and max-pooling. ALE
+            # itself must therefore advance exactly one frame per wrapper step.
+            frameskip=1,
+        )
+        env = gym.wrappers.AtariPreprocessing(
+            env,
+            noop_max=30,
+            frame_skip=config.atari_frame_skip,
+            screen_size=config.atari_screen_size,
+            terminal_on_life_loss=False,
+            grayscale_obs=True,
+            scale_obs=False,
+        )
+        return gym.wrappers.FrameStackObservation(
+            env,
+            stack_size=config.atari_frame_stack,
         )
     return gym.make(env_id)
+
+
+def _prepare_observation(observation: object) -> np.ndarray:
+    """Flatten observations, scaling byte images without an intermediate copy."""
+    array = np.asarray(observation)
+    if array.dtype == np.uint8:
+        return array.reshape(-1).astype(np.float32) / 255.0
+    return array.astype(np.float32, copy=False).reshape(-1)
 
 
 def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
@@ -74,7 +107,7 @@ def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
             env.seed(seed)
             result = env.reset()
     observation = result[0] if isinstance(result, tuple) else result
-    return np.asarray(observation, dtype=np.float32).reshape(-1)
+    return _prepare_observation(observation)
 
 
 def step_env(env: gym.Env, action: int) -> tuple[np.ndarray, float, bool, dict]:
@@ -85,7 +118,7 @@ def step_env(env: gym.Env, action: int) -> tuple[np.ndarray, float, bool, dict]:
         done = terminated or truncated
     else:
         observation, reward, done, info = result
-    return np.asarray(observation, dtype=np.float32).reshape(-1), float(reward), bool(done), info
+    return _prepare_observation(observation), float(reward), bool(done), info
 
 
 class Network(tf.keras.Model):
@@ -97,23 +130,31 @@ class Network(tf.keras.Model):
         # Keras 3 requires Dense(units=...) to be a native Python int.
         self.num_actions = int(num_actions)
         self.representation = tf.keras.Sequential(
-            [tf.keras.layers.Dense(hidden_units, activation="relu"),
-             tf.keras.layers.Dense(hidden_units, activation="relu")]
+            [
+                tf.keras.layers.Dense(hidden_units, activation="relu"),
+                tf.keras.layers.Dense(hidden_units, activation="relu"),
+            ]
         )
         self.dynamics = tf.keras.Sequential(
-            [tf.keras.layers.Dense(hidden_units, activation="relu"),
-             tf.keras.layers.Dense(hidden_units + 1)]
+            [
+                tf.keras.layers.Dense(hidden_units, activation="relu"),
+                tf.keras.layers.Dense(hidden_units + 1),
+            ]
         )
         self.prediction = tf.keras.Sequential(
-            [tf.keras.layers.Dense(hidden_units, activation="relu"),
-             tf.keras.layers.Dense(self.num_actions + 1)]
+            [
+                tf.keras.layers.Dense(hidden_units, activation="relu"),
+                tf.keras.layers.Dense(self.num_actions + 1),
+            ]
         )
 
+    @tf.function(reduce_retracing=True)
     def initial_inference(self, observation: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         hidden_state = self.representation(observation)
         value, policy_logits = self._predict(hidden_state)
         return hidden_state, value, policy_logits
 
+    @tf.function(reduce_retracing=True)
     def recurrent_inference(
         self, hidden_state: tf.Tensor, action: tf.Tensor
     ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
@@ -153,6 +194,34 @@ class Experience:
     value: float
 
 
+class ReplayBuffer:
+    """Fixed-size ring buffer with constant-time random access.
+
+    ``collections.deque`` indexing walks from an end and becomes a major
+    training bottleneck once an Atari replay buffer contains many transitions.
+    """
+
+    def __init__(self, capacity: int):
+        if capacity <= 0:
+            raise ValueError("replay capacity must be positive")
+        self.capacity = capacity
+        self._items: list[Experience] = []
+        self._next = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, index: int) -> Experience:
+        return self._items[index]
+
+    def append(self, experience: Experience) -> None:
+        if len(self._items) < self.capacity:
+            self._items.append(experience)
+        else:
+            self._items[self._next] = experience
+        self._next = (self._next + 1) % self.capacity
+
+
 @dataclass
 class ArchiveEntry:
     """A reproducible Go-Explore cell and the best trajectory reaching it."""
@@ -171,11 +240,13 @@ class CellEncoder:
         rng = np.random.default_rng(seed)
         # An appended constant makes these random hyperplanes affine, allowing
         # observations that differ mostly in magnitude to occupy different cells.
-        self.projection = rng.normal(size=(observation_size + 1, bits)).astype(np.float32)
+        affine = rng.normal(size=(observation_size + 1, bits)).astype(np.float32)
+        self.projection = affine[:-1]
+        self.bias = affine[-1]
 
     def encode(self, observation: np.ndarray) -> bytes:
-        vector = np.append(np.asarray(observation, dtype=np.float32), 1.0)
-        bits = np.matmul(vector, self.projection) >= 0
+        vector = np.asarray(observation, dtype=np.float32)
+        bits = np.matmul(vector, self.projection) + self.bias >= 0
         return np.packbits(bits).tobytes()
 
 
@@ -191,8 +262,10 @@ class GoExploreArchive:
     def add(self, observation: np.ndarray, entry: ArchiveEntry) -> bool:
         key = self.encoder.encode(observation)
         previous = self.cells.get(key)
-        improved = previous is None or entry.score > previous.score or (
-            entry.score == previous.score and len(entry.actions) < len(previous.actions)
+        improved = (
+            previous is None
+            or entry.score > previous.score
+            or (entry.score == previous.score and len(entry.actions) < len(previous.actions))
         )
         if not improved:
             return False
@@ -231,7 +304,7 @@ class MuZero:
         self.num_actions = int(env.action_space.n)
         self.optimizer = tf.keras.optimizers.Adam(config.learning_rate)
 
-        self.replay: deque[Experience] = deque(maxlen=config.replay_capacity)
+        self.replay = ReplayBuffer(config.replay_capacity)
 
         observation_size = gym.spaces.flatdim(env.observation_space)
         self.rng = np.random.default_rng(seed)
@@ -243,27 +316,21 @@ class MuZero:
 
     @staticmethod
     def _expand(node: Node, logits: np.ndarray) -> None:
-        priors = tf.nn.softmax(logits).numpy()
-        node.children = {
-            action: Node(float(prior))
-            for action, prior in enumerate(priors)
-        }
+        # Avoid dispatching a tiny TensorFlow op (and synchronizing the device)
+        # for every expanded MCTS node.
+        shifted = logits - np.max(logits)
+        priors = np.exp(shifted)
+        priors /= priors.sum()
+        node.children = {action: Node(float(prior)) for action, prior in enumerate(priors)}
 
     def _select_child(self, node: Node) -> tuple[int, Node]:
         scale = np.sqrt(node.visit_count + 1)
 
         def score(child: Node) -> float:
             exploration = (
-                self.config.exploration_constant
-                * child.prior
-                * scale
-                / (child.visit_count + 1)
+                self.config.exploration_constant * child.prior * scale / (child.visit_count + 1)
             )
-            return (
-                child.reward
-                + self.config.gamma * child.value
-                + exploration
-            )
+            return child.reward + self.config.gamma * child.value + exploration
 
         return max(node.children.items(), key=lambda item: score(item[1]))
 
@@ -286,14 +353,12 @@ class MuZero:
 
                 if node.hidden_state is None:
                     parent_hidden = path[-2].hidden_state
-                    next_hidden, reward, leaf_value, leaf_logits = (
-                        self.network.recurrent_inference(
-                            tf.convert_to_tensor(
-                                parent_hidden[None, :],
-                                dtype=tf.float32,
-                            ),
-                            tf.convert_to_tensor([action]),
-                        )
+                    next_hidden, reward, leaf_value, leaf_logits = self.network.recurrent_inference(
+                        tf.convert_to_tensor(
+                            parent_hidden[None, :],
+                            dtype=tf.float32,
+                        ),
+                        tf.convert_to_tensor([action]),
                     )
                     node.hidden_state = next_hidden.numpy()[0]
                     node.reward = float(reward.numpy()[0])
@@ -304,10 +369,7 @@ class MuZero:
             for visited in reversed(path):
                 visited.visit_count += 1
                 visited.value_sum += value_to_back_up
-                value_to_back_up = (
-                    visited.reward
-                    + self.config.gamma * value_to_back_up
-                )
+                value_to_back_up = visited.reward + self.config.gamma * value_to_back_up
 
         return root
 
@@ -317,9 +379,7 @@ class MuZero:
         seed: int | None = None,
     ) -> None:
         for episode in range(num_episodes):
-            episode_seed = (
-                None if seed is None else seed + episode
-            )
+            episode_seed = None if seed is None else seed + episode
 
             # Always create a reproducible starting cell for this episode.
             initial_observation = reset_env(self.env, episode_seed)
@@ -344,19 +404,14 @@ class MuZero:
             ) = self._return_to_cell(start)
 
             actions = list(completed_actions)
-            trajectory: list[
-                tuple[np.ndarray, int, float, np.ndarray, np.ndarray]
-            ] = []
+            trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
 
             if not done:
                 for _ in range(self.config.max_steps_per_episode):
                     root = self.mcts(observation)
 
                     visits = np.asarray(
-                        [
-                            root.children[action].visit_count
-                            for action in range(self.num_actions)
-                        ],
+                        [root.children[action].visit_count for action in range(self.num_actions)],
                         dtype=np.float64,
                     )
 
@@ -367,9 +422,7 @@ class MuZero:
                             dtype=np.float32,
                         )
                     else:
-                        policy_target = (
-                            visits / visits.sum()
-                        ).astype(np.float32)
+                        policy_target = (visits / visits.sum()).astype(np.float32)
 
                     action = int(
                         self.rng.choice(
@@ -421,10 +474,7 @@ class MuZero:
                 next_observation_t,
                 policy_t,
             ) in reversed(trajectory):
-                discounted_return = (
-                    reward_t
-                    + self.config.gamma * discounted_return
-                )
+                discounted_return = reward_t + self.config.gamma * discounted_return
                 self.replay.append(
                     Experience(
                         observation=observation_t,
@@ -439,17 +489,10 @@ class MuZero:
             losses = []
             if self.replay:
                 losses = [
-                    self._train_batch()
-                    for _ in range(
-                        self.config.training_steps_per_episode
-                    )
+                    self._train_batch() for _ in range(self.config.training_steps_per_episode)
                 ]
 
-            mean_loss = (
-                float(np.mean(losses))
-                if losses
-                else float("nan")
-            )
+            mean_loss = float(np.mean(losses)) if losses else float("nan")
 
             print(
                 f"Episode {episode + 1}: "
@@ -502,9 +545,7 @@ class MuZero:
         )
         batch = [self.replay[int(index)] for index in indices]
 
-        observations = np.stack(
-            [sample.observation for sample in batch]
-        ).astype(np.float32)
+        observations = np.stack([sample.observation for sample in batch]).astype(np.float32)
         actions = np.asarray(
             [sample.action for sample in batch],
             dtype=np.int32,
@@ -513,12 +554,10 @@ class MuZero:
             [sample.reward for sample in batch],
             dtype=np.float32,
         )
-        next_observations = np.stack(
-            [sample.next_observation for sample in batch]
-        ).astype(np.float32)
-        policies = np.stack(
-            [sample.policy for sample in batch]
-        ).astype(np.float32)
+        next_observations = np.stack([sample.next_observation for sample in batch]).astype(
+            np.float32
+        )
+        policies = np.stack([sample.policy for sample in batch]).astype(np.float32)
         values = np.asarray(
             [sample.value for sample in batch],
             dtype=np.float32,
@@ -572,18 +611,10 @@ class MuZero:
                 )
             )
             consistency_loss = tf.reduce_mean(
-                tf.square(
-                    next_hidden
-                    - tf.stop_gradient(target_hidden)
-                )
+                tf.square(next_hidden - tf.stop_gradient(target_hidden))
             )
 
-            loss = (
-                value_loss
-                + reward_loss
-                + policy_loss
-                + 0.1 * consistency_loss
-            )
+            loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
 
         gradients = tape.gradient(
             loss,
@@ -599,18 +630,15 @@ class MuZero:
         ]
 
         if gradient_variable_pairs:
-            grads, variables = zip(
-                *gradient_variable_pairs
-            )
+            grads, variables = zip(*gradient_variable_pairs)
             clipped_grads, _ = tf.clip_by_global_norm(
                 grads,
                 self.config.gradient_clip_norm,
             )
-            self.optimizer.apply_gradients(
-                zip(clipped_grads, variables)
-            )
+            self.optimizer.apply_gradients(zip(clipped_grads, variables))
 
         return float(loss.numpy())
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -622,13 +650,14 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--archive-capacity", type=int, default=10_000)
     parser.add_argument("--cell-bits", type=int, default=16)
+    parser.add_argument("--atari-screen-size", type=int, default=84)
+    parser.add_argument("--atari-frame-skip", type=int, default=4)
+    parser.add_argument("--atari-frame-stack", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
-    env = make_env(args.env)
-    env.action_space.seed(args.seed)
     config = Config(
         num_simulations=args.simulations,
         batch_size=args.batch_size,
@@ -636,7 +665,12 @@ def main() -> None:
         learning_rate=args.learning_rate,
         archive_capacity=args.archive_capacity,
         cell_bits=args.cell_bits,
+        atari_screen_size=args.atari_screen_size,
+        atari_frame_skip=args.atari_frame_skip,
+        atari_frame_stack=args.atari_frame_stack,
     )
+    env = make_env(args.env, config)
+    env.action_space.seed(args.seed)
     try:
         network = Network(int(env.action_space.n), config.hidden_units)
         MuZero(env, network, config, args.seed).train(args.episodes, args.seed)
