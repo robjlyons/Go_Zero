@@ -1,25 +1,23 @@
 """A small, self-contained MuZero-style training example.
 
-This is intentionally an educational implementation: it uses episode returns
-and replay rather than MuZero's full unrolled training procedure.
+This is intentionally an educational implementation: it uses one-step online
+targets rather than MuZero's replay buffer and unrolled training procedure.
 Importing this module is safe; training only starts through :func:`main`.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import deque
 from dataclasses import dataclass, field
+import gym
+import numpy as np
+np.bool8 = np.bool
 import os
 
-import gymnasium as gym
-import numpy as np
-
-# Avoid TensorFlow probing CUDA on CPU-only hosts. Set GO_ZERO_USE_GPU=1 to opt
-# in; this must happen before TensorFlow is imported.
-if os.environ.get("GO_ZERO_USE_GPU") != "1":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# This small example runs on the CPU unless the caller explicitly selects CUDA
+# before starting Python (for example, CUDA_VISIBLE_DEVICES=0). Setting this
+# before importing TensorFlow prevents noisy cuInit failures on CPU-only hosts.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
 import tensorflow as tf
 
@@ -32,39 +30,30 @@ class Config:
     hidden_units: int = 128
     max_steps_per_episode: int = 500
     exploration_constant: float = 1.25
-    batch_size: int = 32
-    replay_capacity: int = 10_000
-    training_steps_per_episode: int = 20
-    gradient_clip_norm: float = 5.0
-
-    def __post_init__(self) -> None:
-        positive_fields = (
-            "learning_rate",
-            "num_simulations",
-            "hidden_units",
-            "max_steps_per_episode",
-            "batch_size",
-            "replay_capacity",
-            "training_steps_per_episode",
-            "gradient_clip_norm",
-        )
-        for name in positive_fields:
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be greater than zero")
-        if not 0.0 <= self.gamma <= 1.0:
-            raise ValueError("gamma must be between zero and one")
 
 
 def reset_env(env: gym.Env, seed: int | None = None) -> np.ndarray:
-    """Reset a Gymnasium environment and return a flattened observation."""
-    observation, _ = env.reset(seed=seed)
+    """Reset old or new Gym environments and return only the observation."""
+    if seed is None:
+        result = env.reset()
+    else:
+        try:
+            result = env.reset(seed=seed)
+        except TypeError:  # Gym before 0.21 used a separate seed method.
+            env.seed(seed)
+            result = env.reset()
+    observation = result[0] if isinstance(result, tuple) else result
     return np.asarray(observation, dtype=np.float32).reshape(-1)
 
 
 def step_env(env: gym.Env, action: int) -> tuple[np.ndarray, float, bool, dict]:
-    """Step a Gymnasium environment and combine its two completion flags."""
-    observation, reward, terminated, truncated, info = env.step(action)
-    done = terminated or truncated
+    """Step old or new Gym environments using one consistent API."""
+    result = env.step(action)
+    if len(result) == 5:
+        observation, reward, terminated, truncated, info = result
+        done = terminated or truncated
+    else:
+        observation, reward, done, info = result
     return np.asarray(observation, dtype=np.float32).reshape(-1), float(reward), bool(done), info
 
 
@@ -121,23 +110,8 @@ class Node:
         return self.value_sum / self.visit_count if self.visit_count else 0.0
 
 
-@dataclass(frozen=True)
-class Experience:
-    observation: np.ndarray
-    action: int
-    reward: float
-    next_observation: np.ndarray
-    policy: np.ndarray
-    value: float
-
-
 class MuZero:
     def __init__(self, env: gym.Env, network: Network, config: Config):
-        if not isinstance(env, gym.Env):
-            raise TypeError(
-                "env must be a Gymnasium environment; legacy Gym environments "
-                "are incompatible with NumPy 2"
-            )
         if not isinstance(env.action_space, gym.spaces.Discrete):
             raise ValueError("This example requires a discrete action space")
         self.env = env
@@ -145,7 +119,6 @@ class MuZero:
         self.config = config
         self.num_actions = env.action_space.n
         self.optimizer = tf.keras.optimizers.Adam(config.learning_rate)
-        self.replay: deque[Experience] = deque(maxlen=config.replay_capacity)
 
     @staticmethod
     def _expand(node: Node, logits: np.ndarray) -> None:
@@ -198,59 +171,36 @@ class MuZero:
         for episode in range(num_episodes):
             observation = reset_env(self.env, None if seed is None else seed + episode)
             total_reward = 0.0
-            trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
+            losses: list[float] = []
             for _ in range(self.config.max_steps_per_episode):
                 root = self.mcts(observation)
                 visits = np.array([root.children[a].visit_count for a in range(self.num_actions)])
                 policy_target = visits / max(visits.sum(), 1)
                 action = int(np.random.choice(self.num_actions, p=policy_target))
                 next_observation, reward, done, _ = step_env(self.env, action)
-                trajectory.append(
-                    (observation.copy(), action, reward, next_observation.copy(), policy_target)
-                )
+                losses.append(self._train_step(observation, action, reward, next_observation, done, policy_target))
                 observation = next_observation
                 total_reward += reward
                 if done:
                     break
+            print(f"Episode {episode + 1}: reward={total_reward:.2f}, loss={np.mean(losses):.4f}")
 
-            discounted_return = 0.0
-            for observation, action, reward, next_observation, policy in reversed(trajectory):
-                discounted_return = reward + self.config.gamma * discounted_return
-                self.replay.append(
-                    Experience(observation, action, reward, next_observation, policy, discounted_return)
-                )
-
-            losses = [self._train_batch() for _ in range(self.config.training_steps_per_episode)]
-            print(
-                f"Episode {episode + 1}: reward={total_reward:.2f}, "
-                f"loss={np.mean(losses):.4f}, replay={len(self.replay)}"
-            )
-
-    def _train_batch(self) -> float:
-        batch_size = min(self.config.batch_size, len(self.replay))
-        indices = np.random.choice(len(self.replay), batch_size, replace=False)
-        batch = [self.replay[index] for index in indices]
-        observations = np.stack([sample.observation for sample in batch])
-        actions = np.asarray([sample.action for sample in batch], dtype=np.int32)
-        rewards = np.asarray([sample.reward for sample in batch], dtype=np.float32)
-        next_observations = np.stack([sample.next_observation for sample in batch])
-        policies = np.stack([sample.policy for sample in batch])
-        values = np.asarray([sample.value for sample in batch], dtype=np.float32)
-
+    def _train_step(self, observation, action, reward, next_observation, done, policy_target) -> float:
         with tf.GradientTape() as tape:
-            hidden, predicted_values, logits = self.network.initial_inference(observations)
-            next_hidden, predicted_rewards, _, _ = self.network.recurrent_inference(hidden, actions)
-            value_loss = tf.reduce_mean(tf.keras.losses.huber(values, predicted_values))
-            reward_loss = tf.reduce_mean(tf.keras.losses.huber(rewards, predicted_rewards))
-            policy_loss = tf.reduce_mean(
-                tf.nn.softmax_cross_entropy_with_logits(labels=policies, logits=logits)
-            )
+            hidden, value, logits = self.network.initial_inference(observation[None, :])
+            next_hidden, predicted_reward, _, _ = self.network.recurrent_inference(hidden, [action])
+            _, next_value, _ = self.network.initial_inference(next_observation[None, :])
+            target_value = reward + self.config.gamma * next_value[0] * (1.0 - float(done))
+            value_loss = tf.square(tf.stop_gradient(target_value) - value[0])
+            reward_loss = tf.square(reward - predicted_reward[0])
+            policy_loss = tf.nn.softmax_cross_entropy_with_logits(
+                labels=policy_target[None, :], logits=logits
+            )[0]
             # Encourage the learned dynamics state to match the next represented state.
-            target_hidden = self.network.representation(next_observations)
+            target_hidden = self.network.representation(next_observation[None, :])
             consistency_loss = tf.reduce_mean(tf.square(next_hidden - tf.stop_gradient(target_hidden)))
             loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
         gradients = tape.gradient(loss, self.network.trainable_variables)
-        gradients, _ = tf.clip_by_global_norm(gradients, self.config.gradient_clip_norm)
         self.optimizer.apply_gradients(
             (gradient, variable) for gradient, variable in zip(gradients, self.network.trainable_variables)
             if gradient is not None
@@ -263,22 +213,13 @@ def main() -> None:
     parser.add_argument("--env", default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--simulations", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--training-steps", type=int, default=20)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
     env = gym.make(args.env)
-    env.action_space.seed(args.seed)
-    config = Config(
-        num_simulations=args.simulations,
-        batch_size=args.batch_size,
-        training_steps_per_episode=args.training_steps,
-        learning_rate=args.learning_rate,
-    )
+    config = Config(num_simulations=args.simulations)
     try:
         network = Network(env.action_space.n, config.hidden_units)
         MuZero(env, network, config).train(args.episodes, args.seed)
