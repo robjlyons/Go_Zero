@@ -110,7 +110,6 @@ class Node:
         return self.value_sum / self.visit_count if self.visit_count else 0.0
 
 
-<<<<<<< codex/review-code-for-errors-and-improvements-nuu7cs
 @dataclass(frozen=True)
 class Experience:
     observation: np.ndarray
@@ -189,10 +188,8 @@ class MuZero:
                 "env must be a Gymnasium environment; legacy Gym environments "
                 "are incompatible with NumPy 2"
             )
-=======
 class MuZero:
     def __init__(self, env: gym.Env, network: Network, config: Config):
->>>>>>> main
         if not isinstance(env.action_space, gym.spaces.Discrete):
             raise ValueError("This example requires a discrete action space")
         self.env = env
@@ -200,15 +197,12 @@ class MuZero:
         self.config = config
         self.num_actions = env.action_space.n
         self.optimizer = tf.keras.optimizers.Adam(config.learning_rate)
-<<<<<<< codex/review-code-for-errors-and-improvements-nuu7cs
         self.replay: deque[Experience] = deque(maxlen=config.replay_capacity)
         observation_size = gym.spaces.flatdim(env.observation_space)
         self.rng = np.random.default_rng(seed)
         self.archive = GoExploreArchive(
             CellEncoder(observation_size, config.cell_bits, seed), config.archive_capacity, self.rng
         )
-=======
->>>>>>> main
 
     @staticmethod
     def _expand(node: Node, logits: np.ndarray) -> None:
@@ -258,32 +252,16 @@ class MuZero:
         return root
 
     def train(self, num_episodes: int, seed: int | None = None) -> None:
-<<<<<<< codex/review-code-for-errors-and-improvements-nuu7cs
-        initial_seed = 0 if seed is None else seed
-        initial_observation = reset_env(self.env, initial_seed)
-        self.archive.add(initial_observation, ArchiveEntry(initial_seed, (), 0.0))
-        for episode in range(num_episodes):
-            start = self.archive.select()
-            observation, total_reward, restored_actions, done = self._return_to_cell(start)
-            trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
-            actions = list(restored_actions)
-            steps_remaining = self.config.max_steps_per_episode - len(actions)
-            for _ in range(max(0, steps_remaining)):
-                if done:
-                    break
-=======
         for episode in range(num_episodes):
             observation = reset_env(self.env, None if seed is None else seed + episode)
             total_reward = 0.0
             losses: list[float] = []
             for _ in range(self.config.max_steps_per_episode):
->>>>>>> main
                 root = self.mcts(observation)
                 visits = np.array([root.children[a].visit_count for a in range(self.num_actions)])
                 policy_target = visits / max(visits.sum(), 1)
                 action = int(np.random.choice(self.num_actions, p=policy_target))
                 next_observation, reward, done, _ = step_env(self.env, action)
-<<<<<<< codex/review-code-for-errors-and-improvements-nuu7cs
                 actions.append(action)
                 trajectory.append(
                     (observation.copy(), action, reward, next_observation.copy(), policy_target)
@@ -350,7 +328,6 @@ class MuZero:
             loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
         gradients = tape.gradient(loss, self.network.trainable_variables)
         gradients, _ = tf.clip_by_global_norm(gradients, self.config.gradient_clip_norm)
-=======
                 losses.append(self._train_step(observation, action, reward, next_observation, done, policy_target))
                 observation = next_observation
                 total_reward += reward
@@ -374,7 +351,6 @@ class MuZero:
             consistency_loss = tf.reduce_mean(tf.square(next_hidden - tf.stop_gradient(target_hidden)))
             loss = value_loss + reward_loss + policy_loss + 0.1 * consistency_loss
         gradients = tape.gradient(loss, self.network.trainable_variables)
->>>>>>> main
         self.optimizer.apply_gradients(
             (gradient, variable) for gradient, variable in zip(gradients, self.network.trainable_variables)
             if gradient is not None
@@ -387,21 +363,17 @@ def main() -> None:
     parser.add_argument("--env", default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--simulations", type=int, default=50)
-<<<<<<< codex/review-code-for-errors-and-improvements-nuu7cs
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--training-steps", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--archive-capacity", type=int, default=10_000)
     parser.add_argument("--cell-bits", type=int, default=16)
-=======
->>>>>>> main
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
     env = gym.make(args.env)
-<<<<<<< codex/review-code-for-errors-and-improvements-nuu7cs
     env.action_space.seed(args.seed)
     config = Config(
         num_simulations=args.simulations,
@@ -414,12 +386,10 @@ def main() -> None:
     try:
         network = Network(env.action_space.n, config.hidden_units)
         MuZero(env, network, config, args.seed).train(args.episodes, args.seed)
-=======
     config = Config(num_simulations=args.simulations)
     try:
         network = Network(env.action_space.n, config.hidden_units)
         MuZero(env, network, config).train(args.episodes, args.seed)
->>>>>>> main
     finally:
         env.close()
 
