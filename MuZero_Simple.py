@@ -32,13 +32,13 @@ class Config:
     learning_rate: float = 1e-3
     num_simulations: int = 50
     hidden_units: int = 128
-    max_steps_per_episode: int = 500
+    max_steps_per_rollout: int = 500
     exploration_constant: float = 1.25
 
     # Replay/training settings.
     replay_capacity: int = 50_000
     batch_size: int = 32
-    training_steps_per_episode: int = 20
+    training_steps_per_rollout: int = 20
     gradient_clip_norm: float = 5.0
 
     # Go-Explore archive settings.
@@ -375,15 +375,26 @@ class MuZero:
 
     def train(
         self,
-        num_episodes: int,
+        max_steps: int,
         seed: int | None = None,
     ) -> None:
-        for episode in range(num_episodes):
-            episode_seed = None if seed is None else seed + episode
+        """Train until ``max_steps`` environment transitions have been executed.
 
-            # Always create a reproducible starting cell for this episode.
-            initial_observation = reset_env(self.env, episode_seed)
-            archive_seed = episode if episode_seed is None else episode_seed
+        Returning to a Go-Explore cell also advances the environment, so those
+        replayed actions count toward the limit. This makes the budget a hard
+        upper bound on emulator work rather than merely on collected samples.
+        """
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive")
+
+        total_steps = 0
+        rollout = 0
+        while total_steps < max_steps:
+            rollout_seed = None if seed is None else seed + rollout
+
+            # Always create a reproducible starting cell for this rollout.
+            initial_observation = reset_env(self.env, rollout_seed)
+            archive_seed = rollout if rollout_seed is None else rollout_seed
             self.archive.add(
                 initial_observation,
                 ArchiveEntry(
@@ -401,13 +412,14 @@ class MuZero:
                 total_reward,
                 completed_actions,
                 done,
-            ) = self._return_to_cell(start)
+            ) = self._return_to_cell(start, max_steps - total_steps)
+            total_steps += len(completed_actions)
 
             actions = list(completed_actions)
             trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
 
-            if not done:
-                for _ in range(self.config.max_steps_per_episode):
+            if not done and total_steps < max_steps:
+                for _ in range(self.config.max_steps_per_rollout):
                     root = self.mcts(observation)
 
                     visits = np.asarray(
@@ -437,6 +449,7 @@ class MuZero:
                         done,
                         _,
                     ) = step_env(self.env, action)
+                    total_steps += 1
 
                     actions.append(action)
                     trajectory.append(
@@ -462,7 +475,7 @@ class MuZero:
                         ),
                     )
 
-                    if done:
+                    if done or total_steps >= max_steps:
                         break
 
             # Monte-Carlo return targets for each transition.
@@ -489,22 +502,25 @@ class MuZero:
             losses = []
             if self.replay:
                 losses = [
-                    self._train_batch() for _ in range(self.config.training_steps_per_episode)
+                    self._train_batch() for _ in range(self.config.training_steps_per_rollout)
                 ]
 
             mean_loss = float(np.mean(losses)) if losses else float("nan")
 
             print(
-                f"Episode {episode + 1}: "
+                f"Rollout {rollout + 1}: "
+                f"steps={total_steps}/{max_steps}, "
                 f"reward={total_reward:.2f}, "
                 f"loss={mean_loss:.4f}, "
                 f"replay={len(self.replay)}, "
                 f"archive={len(self.archive.cells)}"
             )
+            rollout += 1
 
     def _return_to_cell(
         self,
         entry: ArchiveEntry,
+        max_steps: int | None = None,
     ) -> tuple[np.ndarray, float, tuple[int, ...], bool]:
         """Restore a cell by deterministically replaying its action trajectory."""
         observation = reset_env(self.env, entry.seed)
@@ -513,6 +529,8 @@ class MuZero:
         done = False
 
         for action in entry.actions:
+            if max_steps is not None and len(completed_actions) >= max_steps:
+                break
             observation, reward, done, _ = step_env(
                 self.env,
                 action,
@@ -643,7 +661,7 @@ class MuZero:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", default="CartPole-v1")
-    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--max-steps", type=int, default=10_000)
     parser.add_argument("--simulations", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--training-steps", type=int, default=20)
@@ -661,7 +679,7 @@ def main() -> None:
     config = Config(
         num_simulations=args.simulations,
         batch_size=args.batch_size,
-        training_steps_per_episode=args.training_steps,
+        training_steps_per_rollout=args.training_steps,
         learning_rate=args.learning_rate,
         archive_capacity=args.archive_capacity,
         cell_bits=args.cell_bits,
@@ -673,7 +691,7 @@ def main() -> None:
     env.action_space.seed(args.seed)
     try:
         network = Network(int(env.action_space.n), config.hidden_units)
-        MuZero(env, network, config, args.seed).train(args.episodes, args.seed)
+        MuZero(env, network, config, args.seed).train(args.max_steps, args.seed)
     finally:
         env.close()
 

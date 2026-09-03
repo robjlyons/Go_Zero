@@ -19,8 +19,12 @@ Run the repository's entry point (rather than an older copied notebook or
 `Go_Zero.py` file):
 
 ```bash
-python MuZero_Simple.py --env CartPole-v1 --episodes 10
+python MuZero_Simple.py --env CartPole-v1 --max-steps 10000
 ```
+
+Training uses a hard environment-transition budget rather than an episode
+count. Actions replayed while returning to a Go-Explore archive cell are
+included in `--max-steps`, so the limit also bounds emulator work.
 
 ## Atari performance
 
@@ -32,7 +36,7 @@ input from 100,800 raw RGB values to 28,224 values and avoids processing every
 emulator frame independently.
 
 ```bash
-python MuZero_Simple.py --env ALE/Pong-v5 --episodes 10
+python MuZero_Simple.py --env ALE/Pong-v5 --max-steps 1000000
 ```
 
 The defaults can be tuned with `--atari-screen-size`, `--atari-frame-skip`, and
