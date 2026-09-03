@@ -331,9 +331,9 @@ class MuZero:
             losses.append(self._train_step(observation, action, reward, next_observation, done, policy_target))
             observation = next_observation
             total_reward += reward
-            if done:
-                break
-            print(f"Episode {episode + 1}: reward={total_reward:.2f}, loss={np.mean(losses):.4f}")
+        if done:
+            break
+        print(f"Episode {episode + 1}: reward={total_reward:.2f}, loss={np.mean(losses):.4f}")
 
     def _train_step(self, observation, action, reward, next_observation, done, policy_target) -> float:
         with tf.GradientTape() as tape:
