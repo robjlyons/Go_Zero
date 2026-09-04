@@ -1067,12 +1067,21 @@ def main() -> None:
             tf.zeros((1,), dtype=tf.int32),
         )
 
+        # ``Network`` is a subclassed Keras model, so calling count_params()
+        # on the outer wrapper can fail even after the component models have
+        # been traced.  Count the already-built component models directly.
+        total_params = (
+            network.representation.count_params()
+            + network.dynamics.count_params()
+            + network.prediction.count_params()
+        )
+
         representation_name = "CNN" if network.uses_cnn else "MLP"
         print(
             f"Representation: {representation_name}; "
             f"observation_shape={observation_shape}; "
             f"latent={config.hidden_units}; "
-            f"parameters={network.count_params():,}; "
+            f"parameters={total_params:,}; "
             f"device={selected_device}"
         )
 
