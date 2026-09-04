@@ -38,6 +38,10 @@ class Config:
     max_steps_per_rollout: int = 500
     exploration_constant: float = 1.25
 
+    # MuZero root exploration noise.
+    root_dirichlet_alpha: float = 0.3
+    root_exploration_fraction: float = 0.25
+
     # Replay/training settings.
     replay_capacity: int = 50_000
     batch_size: int = 32
@@ -326,6 +330,37 @@ class MuZero:
         priors /= priors.sum()
         node.children = {action: Node(float(prior)) for action, prior in enumerate(priors)}
 
+    def _add_root_exploration_noise(self, root: Node) -> None:
+        """Mix Dirichlet noise into root priors for training-time exploration.
+
+        Noise is applied only to the MCTS root; deeper nodes keep the
+        network priors unchanged.
+        """
+        if not root.children:
+            return
+
+        fraction = self.config.root_exploration_fraction
+        alpha = self.config.root_dirichlet_alpha
+
+        if fraction <= 0.0:
+            return
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("root_exploration_fraction must be in [0, 1]")
+        if alpha <= 0.0:
+            raise ValueError("root_dirichlet_alpha must be > 0")
+
+        actions = list(root.children)
+        noise = self.rng.dirichlet(
+            np.full(len(actions), alpha, dtype=np.float64)
+        )
+
+        keep = 1.0 - fraction
+        for action, noise_value in zip(actions, noise):
+            child = root.children[action]
+            child.prior = float(
+                keep * child.prior + fraction * noise_value
+            )
+
     def _select_child(self, node: Node) -> tuple[int, Node]:
         scale = np.sqrt(node.visit_count + 1)
 
@@ -344,6 +379,7 @@ class MuZero:
 
         root = Node(1.0, hidden.numpy()[0])
         self._expand(root, logits.numpy()[0])
+        self._add_root_exploration_noise(root)
 
         for _ in range(self.config.num_simulations):
             node = root
@@ -704,6 +740,18 @@ def main() -> None:
         help="JSON Lines destination for rollout and throughput metrics",
     )
     parser.add_argument("--simulations", type=int, default=50)
+    parser.add_argument(
+        "--dirichlet-alpha",
+        type=float,
+        default=0.3,
+        help="Dirichlet alpha used for MCTS root exploration noise",
+    )
+    parser.add_argument(
+        "--root-noise-fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of each MCTS root prior replaced by Dirichlet noise",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--training-steps", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -719,6 +767,8 @@ def main() -> None:
     tf.random.set_seed(args.seed)
     config = Config(
         num_simulations=args.simulations,
+        root_dirichlet_alpha=args.dirichlet_alpha,
+        root_exploration_fraction=args.root_noise_fraction,
         batch_size=args.batch_size,
         training_steps_per_rollout=args.training_steps,
         learning_rate=args.learning_rate,
