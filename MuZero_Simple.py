@@ -248,7 +248,7 @@ class CellEncoder:
         self.bias = affine[-1]
 
     def encode(self, observation: np.ndarray) -> bytes:
-        vector = np.asarray(observation, dtype=np.float32)
+        vector = np.asarray(observation, dtype=np.float32) - 0.5
         bits = np.matmul(vector, self.projection) + self.bias >= 0
         return np.packbits(bits).tobytes()
 
