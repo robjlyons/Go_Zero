@@ -42,6 +42,11 @@ class Config:
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
 
+    # Explicit post-restore exploration.  Most actions still come from MCTS,
+    # while a minority deliberately probe under-tried or random actions.
+    novelty_exploration_fraction: float = 0.25
+    random_exploration_fraction: float = 0.05
+
     # Replay/training settings.
     replay_capacity: int = 50_000
     batch_size: int = 32
@@ -321,6 +326,24 @@ class MuZero:
             self.rng,
         )
 
+        # Per-cell action counts used for count-based novelty exploration.
+        # The key comes from the same cell representation used by Go-Explore.
+        self.cell_action_counts: dict[bytes, np.ndarray] = {}
+
+        exploration_total = (
+            config.novelty_exploration_fraction
+            + config.random_exploration_fraction
+        )
+        if config.novelty_exploration_fraction < 0.0:
+            raise ValueError("novelty_exploration_fraction must be >= 0")
+        if config.random_exploration_fraction < 0.0:
+            raise ValueError("random_exploration_fraction must be >= 0")
+        if exploration_total > 1.0:
+            raise ValueError(
+                "novelty_exploration_fraction + random_exploration_fraction "
+                "must be <= 1"
+            )
+
     @staticmethod
     def _expand(node: Node, logits: np.ndarray) -> None:
         # Avoid dispatching a tiny TensorFlow op (and synchronizing the device)
@@ -360,6 +383,52 @@ class MuZero:
             child.prior = float(
                 keep * child.prior + fraction * noise_value
             )
+
+    def _select_training_action(
+        self,
+        observation: np.ndarray,
+        policy_target: np.ndarray,
+    ) -> tuple[int, str]:
+        """Choose MCTS, novelty-seeking, or random action during collection.
+
+        Novelty is count-based: for the current Go-Explore cell, choose
+        uniformly among the least-tried actions.  Counts include actions taken
+        by every mode, so novelty continuously favours actions that have been
+        neglected in that state.
+
+        The returned ``policy_target`` remains the MCTS visit distribution;
+        exploratory actions therefore improve dynamics/reward coverage without
+        teaching the policy head that random actions are intrinsically optimal.
+        """
+        cell_key = self.archive.encoder.encode(observation)
+        counts = self.cell_action_counts.get(cell_key)
+        if counts is None:
+            counts = np.zeros(self.num_actions, dtype=np.int64)
+            self.cell_action_counts[cell_key] = counts
+
+        draw = float(self.rng.random())
+        random_fraction = self.config.random_exploration_fraction
+        novelty_fraction = self.config.novelty_exploration_fraction
+
+        if draw < random_fraction:
+            action = int(self.rng.integers(self.num_actions))
+            mode = "random"
+        elif draw < random_fraction + novelty_fraction:
+            minimum = counts.min()
+            candidates = np.flatnonzero(counts == minimum)
+            action = int(self.rng.choice(candidates))
+            mode = "novelty"
+        else:
+            action = int(
+                self.rng.choice(
+                    self.num_actions,
+                    p=policy_target,
+                )
+            )
+            mode = "mcts"
+
+        counts[action] += 1
+        return action, mode
 
     def _select_child(self, node: Node) -> tuple[int, Node]:
         scale = np.sqrt(node.visit_count + 1)
@@ -465,6 +534,9 @@ class MuZero:
 
             actions = list(completed_actions)
             trajectory: list[tuple[np.ndarray, int, float, np.ndarray, np.ndarray]] = []
+            mcts_actions = 0
+            novelty_actions = 0
+            random_actions = 0
 
             if not done and total_steps < max_steps:
                 for _ in range(self.config.max_steps_per_rollout):
@@ -484,12 +556,16 @@ class MuZero:
                     else:
                         policy_target = (visits / visits.sum()).astype(np.float32)
 
-                    action = int(
-                        self.rng.choice(
-                            self.num_actions,
-                            p=policy_target,
-                        )
+                    action, action_mode = self._select_training_action(
+                        observation,
+                        policy_target,
                     )
+                    if action_mode == "mcts":
+                        mcts_actions += 1
+                    elif action_mode == "novelty":
+                        novelty_actions += 1
+                    else:
+                        random_actions += 1
 
                     (
                         next_observation,
@@ -565,6 +641,9 @@ class MuZero:
                 "max_steps": max_steps,
                 "collected_steps": collected_steps,
                 "replayed_steps": replayed_steps,
+                "mcts_actions": mcts_actions,
+                "novelty_actions": novelty_actions,
+                "random_actions": random_actions,
                 "reward": total_reward,
                 "loss": mean_loss if np.isfinite(mean_loss) else None,
                 "replay_size": len(self.replay),
@@ -585,7 +664,9 @@ class MuZero:
                 f"loss={mean_loss:.4f}, "
                 f"steps/s={steps_per_second:.2f}, "
                 f"replay={len(self.replay)}, "
-                f"archive={len(self.archive.cells)}"
+                f"archive={len(self.archive.cells)}, "
+                f"actions[mcts/novel/random]="
+                f"{mcts_actions}/{novelty_actions}/{random_actions}"
             )
             rollout += 1
 
@@ -752,6 +833,21 @@ def main() -> None:
         default=0.25,
         help="Fraction of each MCTS root prior replaced by Dirichlet noise",
     )
+    parser.add_argument(
+        "--novelty-exploration-fraction",
+        type=float,
+        default=0.25,
+        help=(
+            "Fraction of collected actions chosen from the least-tried actions "
+            "for the current Go-Explore cell"
+        ),
+    )
+    parser.add_argument(
+        "--random-exploration-fraction",
+        type=float,
+        default=0.05,
+        help="Fraction of collected actions chosen uniformly at random",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--training-steps", type=int, default=20)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -769,6 +865,8 @@ def main() -> None:
         num_simulations=args.simulations,
         root_dirichlet_alpha=args.dirichlet_alpha,
         root_exploration_fraction=args.root_noise_fraction,
+        novelty_exploration_fraction=args.novelty_exploration_fraction,
+        random_exploration_fraction=args.random_exploration_fraction,
         batch_size=args.batch_size,
         training_steps_per_rollout=args.training_steps,
         learning_rate=args.learning_rate,
