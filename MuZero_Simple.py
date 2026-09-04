@@ -21,12 +21,54 @@ import numpy as np
 
 np.bool8 = np.bool
 
-# This small example runs on the CPU unless the caller explicitly selects CUDA
-# before starting Python (for example, CUDA_VISIBLE_DEVICES=0). Setting this
-# before importing TensorFlow prevents noisy cuInit failures on CPU-only hosts.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-
+# TensorFlow is allowed to see CUDA devices.  Device selection is handled
+# explicitly in main() so Colab/Kaggle GPUs are used automatically when present.
 import tensorflow as tf  # noqa: E402
+
+
+def configure_tensorflow_device(device: str = "auto") -> str:
+    """Configure TensorFlow for CPU/GPU execution before model construction.
+
+    ``auto`` uses the first visible GPU when one is available and otherwise
+    falls back to CPU.  ``gpu`` fails loudly if TensorFlow cannot see a GPU.
+    ``cpu`` hides all GPUs from TensorFlow for reproducible CPU comparisons.
+    """
+    device = device.lower()
+    if device not in {"auto", "gpu", "cpu"}:
+        raise ValueError("device must be one of: auto, gpu, cpu")
+
+    physical_gpus = tf.config.list_physical_devices("GPU")
+
+    if device == "cpu":
+        tf.config.set_visible_devices([], "GPU")
+        print("TensorFlow device: CPU (GPU disabled by --device cpu)")
+        return "cpu"
+
+    if not physical_gpus:
+        if device == "gpu":
+            raise RuntimeError(
+                "--device gpu was requested, but TensorFlow cannot see a GPU. "
+                "In Colab, enable a GPU runtime and make sure a GPU-enabled "
+                "TensorFlow build is installed."
+            )
+        print("TensorFlow device: CPU (no GPU detected)")
+        return "cpu"
+
+    # Prevent TensorFlow from reserving all accelerator memory up front.
+    for gpu in physical_gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except (RuntimeError, ValueError):
+            # Memory growth may already have been configured by the notebook.
+            pass
+
+    logical_gpus = tf.config.list_logical_devices("GPU")
+    gpu_name = physical_gpus[0].name
+    print(
+        f"TensorFlow device: GPU ({gpu_name}); "
+        f"logical GPUs={len(logical_gpus)}"
+    )
+    return "gpu"
 
 
 @dataclass(frozen=True)
@@ -57,9 +99,9 @@ class Config:
     archive_capacity: int = 10_000
     cell_bits: int = 16
 
-    # Match the commonly used Stable-Baselines3 Atari input pipeline. Reducing
-    # a raw 210x160x3 frame to four 84x84 grayscale frames is both substantially
-    # faster and much easier for the small fully-connected network to process.
+    # Standard Atari visual pipeline: four 84x84 grayscale frames.  Atari
+    # observations are kept flattened in replay/MCTS storage, then reshaped by
+    # the CNN representation network immediately before convolution.
     atari_screen_size: int = 84
     atari_frame_skip: int = 4
     atari_frame_stack: int = 4
@@ -134,51 +176,163 @@ def step_env(env: gym.Env, action: int) -> tuple[np.ndarray, float, bool, dict]:
 
 
 class Network(tf.keras.Model):
-    """Representation, dynamics, and prediction functions used by MuZero."""
+    """MuZero representation, dynamics, and prediction functions.
 
-    def __init__(self, num_actions: int, hidden_units: int):
+    Atari/image observations use a DQN-style convolutional representation.
+    Vector observations such as CartPole retain the small dense representation.
+    Observations remain flattened outside the network so the existing replay,
+    Go-Explore archive, and MCTS code do not need to change.
+    """
+
+    def __init__(
+        self,
+        num_actions: int,
+        hidden_units: int,
+        observation_shape: tuple[int, ...],
+    ):
         super().__init__()
-        # Gymnasium/ALE may expose Discrete.n as np.int64.
-        # Keras 3 requires Dense(units=...) to be a native Python int.
+
+        # Gymnasium/ALE may expose Discrete.n and shape dimensions as NumPy ints.
         self.num_actions = int(num_actions)
-        self.representation = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-            ]
-        )
+        self.hidden_units = int(hidden_units)
+        self.observation_shape = tuple(int(dim) for dim in observation_shape)
+        self.flat_observation_size = int(np.prod(self.observation_shape))
+
+        self.uses_cnn = self._looks_like_image_observation(self.observation_shape)
+        self.representation = self._build_representation()
+
+        # MuZero latent dynamics remain compact. The expensive spatial processing
+        # happens once in the representation model; recurrent MCTS inference then
+        # operates on the learned latent vector.
         self.dynamics = tf.keras.Sequential(
             [
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
-                tf.keras.layers.Dense(hidden_units + 1),
-            ]
+                tf.keras.layers.Dense(self.hidden_units, activation="relu"),
+                tf.keras.layers.Dense(self.hidden_units + 1),
+            ],
+            name="dynamics",
         )
         self.prediction = tf.keras.Sequential(
             [
-                tf.keras.layers.Dense(hidden_units, activation="relu"),
+                tf.keras.layers.Dense(self.hidden_units, activation="relu"),
                 tf.keras.layers.Dense(self.num_actions + 1),
-            ]
+            ],
+            name="prediction",
         )
 
+    @staticmethod
+    def _looks_like_image_observation(shape: tuple[int, ...]) -> bool:
+        if len(shape) == 2:
+            return min(shape) >= 32
+        if len(shape) != 3:
+            return False
+
+        # Covers FrameStackObservation's (stack, H, W) as well as (H, W, C).
+        return (
+            (shape[0] <= 8 and shape[1] >= 32 and shape[2] >= 32)
+            or (shape[-1] <= 8 and shape[0] >= 32 and shape[1] >= 32)
+        )
+
+    def _build_representation(self) -> tf.keras.Model:
+        inputs = tf.keras.Input(
+            shape=(self.flat_observation_size,),
+            dtype=tf.float32,
+            name="flat_observation",
+        )
+
+        if not self.uses_cnn:
+            x = tf.keras.layers.Dense(
+                self.hidden_units,
+                activation="relu",
+                name="representation_dense_1",
+            )(inputs)
+            hidden = tf.keras.layers.Dense(
+                self.hidden_units,
+                activation="relu",
+                name="representation_dense_2",
+            )(x)
+            return tf.keras.Model(inputs, hidden, name="representation_mlp")
+
+        x = tf.keras.layers.Reshape(
+            self.observation_shape,
+            name="restore_image_shape",
+        )(inputs)
+
+        if len(self.observation_shape) == 2:
+            # Single grayscale image: (H, W) -> (H, W, 1).
+            x = tf.keras.layers.Reshape(
+                (*self.observation_shape, 1),
+                name="add_channel_dimension",
+            )(x)
+        elif self.observation_shape[0] <= 8:
+            # Gymnasium FrameStackObservation gives Atari as (stack, H, W).
+            # Conv2D expects channels-last: (H, W, stack).
+            x = tf.keras.layers.Permute(
+                (2, 3, 1),
+                name="channels_first_to_last",
+            )(x)
+
+        # DQN-style visual encoder. This preserves spatial structure instead of
+        # projecting all 28,224 Atari pixels directly through a dense layer.
+        x = tf.keras.layers.Conv2D(
+            32,
+            kernel_size=8,
+            strides=4,
+            activation="relu",
+            padding="valid",
+            name="conv1",
+        )(x)
+        x = tf.keras.layers.Conv2D(
+            64,
+            kernel_size=4,
+            strides=2,
+            activation="relu",
+            padding="valid",
+            name="conv2",
+        )(x)
+        x = tf.keras.layers.Conv2D(
+            64,
+            kernel_size=3,
+            strides=1,
+            activation="relu",
+            padding="valid",
+            name="conv3",
+        )(x)
+        x = tf.keras.layers.Flatten(name="conv_flatten")(x)
+        hidden = tf.keras.layers.Dense(
+            self.hidden_units,
+            activation="relu",
+            name="representation_latent",
+        )(x)
+
+        return tf.keras.Model(inputs, hidden, name="representation_cnn")
+
     @tf.function(reduce_retracing=True)
-    def initial_inference(self, observation: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        hidden_state = self.representation(observation)
+    def initial_inference(
+        self,
+        observation: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        hidden_state = self.representation(observation, training=False)
         value, policy_logits = self._predict(hidden_state)
         return hidden_state, value, policy_logits
 
     @tf.function(reduce_retracing=True)
     def recurrent_inference(
-        self, hidden_state: tf.Tensor, action: tf.Tensor
+        self,
+        hidden_state: tf.Tensor,
+        action: tf.Tensor,
     ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
         action = tf.one_hot(tf.cast(action, tf.int32), self.num_actions)
-        dynamics_output = self.dynamics(tf.concat([hidden_state, action], axis=-1))
+        dynamics_output = self.dynamics(
+            tf.concat([hidden_state, action], axis=-1),
+            training=False,
+        )
         next_hidden = tf.nn.relu(dynamics_output[:, :-1])
         reward = dynamics_output[:, -1]
         value, policy_logits = self._predict(next_hidden)
         return next_hidden, reward, value, policy_logits
 
     def _predict(self, hidden_state: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        output = self.prediction(hidden_state)
+        output = self.prediction(hidden_state, training=False)
         return output[:, 0], output[:, 1:]
 
 
@@ -735,26 +889,33 @@ class MuZero:
         )
 
         with tf.GradientTape() as tape:
-            (
-                hidden,
-                predicted_values,
-                logits,
-            ) = self.network.initial_inference(
-                tf.convert_to_tensor(
-                    observations,
-                    dtype=tf.float32,
-                )
+            observation_tensor = tf.convert_to_tensor(
+                observations,
+                dtype=tf.float32,
             )
+            action_tensor = tf.convert_to_tensor(actions)
 
-            (
-                next_hidden,
-                predicted_rewards,
-                _,
-                _,
-            ) = self.network.recurrent_inference(
-                hidden,
-                tf.convert_to_tensor(actions),
+            hidden = self.network.representation(
+                observation_tensor,
+                training=True,
             )
+            prediction_output = self.network.prediction(
+                hidden,
+                training=True,
+            )
+            predicted_values = prediction_output[:, 0]
+            logits = prediction_output[:, 1:]
+
+            one_hot_actions = tf.one_hot(
+                tf.cast(action_tensor, tf.int32),
+                self.num_actions,
+            )
+            dynamics_output = self.network.dynamics(
+                tf.concat([hidden, one_hot_actions], axis=-1),
+                training=True,
+            )
+            next_hidden = tf.nn.relu(dynamics_output[:, :-1])
+            predicted_rewards = dynamics_output[:, -1]
 
             value_loss = tf.reduce_mean(
                 tf.keras.losses.huber(
@@ -779,7 +940,8 @@ class MuZero:
                 tf.convert_to_tensor(
                     next_observations,
                     dtype=tf.float32,
-                )
+                ),
+                training=False,
             )
             consistency_loss = tf.reduce_mean(
                 tf.square(next_hidden - tf.stop_gradient(target_hidden))
@@ -814,6 +976,12 @@ class MuZero:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", default="CartPole-v1")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "gpu", "cpu"),
+        default="auto",
+        help="TensorFlow execution device; auto uses a GPU when available",
+    )
     parser.add_argument("--max-steps", type=int, default=10_000)
     parser.add_argument(
         "--log-file",
@@ -859,6 +1027,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    selected_device = configure_tensorflow_device(args.device)
+
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
     config = Config(
@@ -879,7 +1049,33 @@ def main() -> None:
     env = make_env(args.env, config)
     env.action_space.seed(args.seed)
     try:
-        network = Network(int(env.action_space.n), config.hidden_units)
+        observation_shape = tuple(int(dim) for dim in env.observation_space.shape)
+        network = Network(
+            int(env.action_space.n),
+            config.hidden_units,
+            observation_shape,
+        )
+
+        # Build once so startup clearly reports which representation is active.
+        dummy_observation = tf.zeros(
+            (1, int(np.prod(observation_shape))),
+            dtype=tf.float32,
+        )
+        dummy_hidden, _, _ = network.initial_inference(dummy_observation)
+        network.recurrent_inference(
+            dummy_hidden,
+            tf.zeros((1,), dtype=tf.int32),
+        )
+
+        representation_name = "CNN" if network.uses_cnn else "MLP"
+        print(
+            f"Representation: {representation_name}; "
+            f"observation_shape={observation_shape}; "
+            f"latent={config.hidden_units}; "
+            f"parameters={network.count_params():,}; "
+            f"device={selected_device}"
+        )
+
         MuZero(env, network, config, args.seed).train(
             args.max_steps,
             args.seed,
